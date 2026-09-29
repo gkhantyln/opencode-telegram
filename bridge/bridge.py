@@ -160,7 +160,12 @@ def _now():
 
 
 def log(*a):
-    print("[%s]" % _now(), *a, flush=True)
+    """Konsola yaz. Token maskesi buradan gecer.
+
+    Canli testte log dosyalari paylasiliyor; bir hata mesaji yanlislikla
+    bot token'ini icerse (orn. HTTP hata metni URL'den turesin) gizli kalmiyor.
+    """
+    print("[%s]" % _now(), *[_outgoing(str(x)) for x in a], flush=True)
 
 
 # ---------- Telegram API (stdlib) ----------
@@ -266,6 +271,68 @@ def api(method, payload=None, timeout=45, max_retries=None):
             time.sleep(wait)
 
 
+# ---------- opencode ciktisini coz ve temizle ----------
+#
+# Canli test bulgulari (2026-09-29, gercek Telegram):
+#   1. Windows'ta opencode Turkce karakterleri Windows kodlamasiyla (cp1254)
+#      yaziyor. Salt UTF-8 ile okununca 'g' U+FFFD'ye duser ve cevapta
+#      "deste?Yini" gibi bozuk metin gorunuyordu (5 cevabin 5'i).
+#   2. opencode renkli cikti uretiyor: ESC[0m, ESC[91m, ESC[1m... Bunlar ham
+#      gonderilince Telegram'da bozuk karakter olarak gorunuyordu.
+
+# CSI (ESC[...son) + OSC (ESC]...son) + tek karakterli ESC dizileri
+# SIRA ONEMLI: once OSC gelmeli. `[@-Z\\-_]` araligi `]` karakterini de
+# icerdigi icin (backslash -> underscore araligi) once denirse ESC]'i
+# yutar ve OSC govdesi artik eslesmez.
+_ANSI_RE = re.compile(
+    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|[@-Z\\-_]"
+    r"|\[[0-?]*[ -/]*[@-~]"
+    r")")
+
+try:
+    OUTPUT_ENCODINGS = [e.strip() for e in
+                        env("TELEGRAM_OUTPUT_ENCODING",
+                            "cp1254,cp1252,latin-1").split(",") if e.strip()]
+except Exception:  # noqa: BLE001
+    OUTPUT_ENCODINGS = ["cp1254", "cp1252", "latin-1"]
+
+
+def decode_output(raw):
+    """opencode bayt ciktisini metne cevir.
+
+    Once UTF-8 dener (dogru olan yol). Tutmazsa Turkce Windows kodlamasini
+    ve latin-1'i sirayla dener. Hicbiri tutmazsa cokertmeli coz - mesaj
+    kaybolmamali, en kotu birkac bozuk karakter gorunur.
+    """
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in OUTPUT_ENCODINGS:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def clean_text(text):
+    """Telegram'a gidecek metni hazirla: ANSI kontrol kodlarini at, NUL temizle."""
+    if not text:
+        return text
+    return _ANSI_RE.sub("", text).replace("\x00", "")
+
+
+def _outgoing(text):
+    """Telegram'a giden her metin bu darbogazdan gecer: temizle -> maskele."""
+    return _redact(clean_text(text))
+
+
 # ---------- secret maskeleme (tum giden Telegram metni buradan gecer) ----------
 
 _REDACT_PATTERNS = [
@@ -300,7 +367,7 @@ def _audit(chat_id, kind, summary, extra=None):
     try:
         os.makedirs(MAILBOX_DIR, exist_ok=True)
         rec = {"ts": _now(), "chat": str(chat_id), "kind": kind,
-               "summary": _redact((summary or "")[:500])}
+               "summary": _outgoing((summary or "")[:500])}
         if extra:
             rec.update(extra)
         line = json.dumps(rec, ensure_ascii=False) + "\n"
@@ -317,7 +384,7 @@ def _audit(chat_id, kind, summary, extra=None):
 
 def send_message_id(chat_id, text):
     """Ilk parcayi gonderip Telegram message_id doner (duzenleme/callback icin)."""
-    text = _redact(text)
+    text = _outgoing(text)
     first = (text[:4000] or "")
     res = api("sendMessage", {"chat_id": chat_id, "text": first})
     mid = ((res or {}).get("result") or {}).get("message_id")
@@ -331,7 +398,7 @@ def send_message_id(chat_id, text):
 def edit_message(chat_id, message_id, text):
     try:
         api("editMessageText", {"chat_id": chat_id, "message_id": message_id,
-                                "text": _redact(text)[:4000]})
+                                "text": _outgoing(text)[:4000]})
         return True
     except Exception:
         return False
@@ -382,7 +449,7 @@ def send_buttons(chat_id, text, buttons, reply_to=None, cols=2, cancel=None):
     rows = button_grid(buttons, cols=cols)
     if cancel:
         rows.append([{"text": cancel[0], "callback_data": _fit_callback(cancel[1])}])
-    payload = {"chat_id": chat_id, "text": _redact(text)[:4000],
+    payload = {"chat_id": chat_id, "text": _outgoing(text)[:4000],
                "reply_markup": {"inline_keyboard": rows}}
     if reply_to is not None:
         payload["reply_to_message_id"] = reply_to
@@ -404,7 +471,7 @@ def _prune_pending():
 
 def send_message(chat_id, text, reply_to=None):
     """4000'luk parcalarla gonderir. Donus: gonderilen parca sayisi."""
-    text = _redact(text)
+    text = _outgoing(text)
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
     n = 0
     for ch in chunks:
@@ -735,7 +802,7 @@ HELP = (
     "/abort — calisan isi durdur\n"
     "/reset — Telegram oturumunu sifirla (yeni oturum acar)\n"
     "/project — proje listele/sec (cok projeli kullanimda)\n"
-    "/model — aktif model | /model list | /model set <provider/model>\n"
+    "/model — aktif model | /model list [filtre] [sayfa] | /model set <provider/model>\n"
     "/yardim — bu liste\n\n"
     "Duz mesaj = /sor. Fotograf/belge gonderebilirsin (incelenir). "
     "Her chat'te ayni anda tek is calisir."
@@ -868,6 +935,9 @@ def _chat_model(chat_id):
 
 
 _models_cache = {"ts": 0, "list": []}
+# 356 model donen bir opencode kurulumunda tek sayfa okunamazdi. Canli test
+# bulgusu: onceki surum ilk 80'i gosterip geri kalana erisim birakiyordu.
+MODEL_PAGE_SIZE = max(10, int(env("TELEGRAM_MODEL_PAGE_SIZE", "25") or 25))
 
 
 def _opencode_models():
@@ -967,6 +1037,7 @@ def _drain_pipe(stream, sink):
 
     Bunu yapmazsak PIPE ~64 KB'da dolar, cocuk surec yazarken kilitlenir ve
     hic cikmaz; parent da cikis beklerken asilir (bkz. GAP-02).
+    Bayt toplanir, cozme islemi tek yerde yapilir (bkz. decode_output).
     """
     try:
         while True:
@@ -999,7 +1070,7 @@ def _wait_proc(proc, abort, chat_id, timeout, reply_to=None):
         if proc.poll() is not None:
             for r in readers:
                 r.join(timeout=5)
-            return "ok", "".join(out_buf), "".join(err_buf)
+            return "ok", decode_output(b"".join(out_buf)), decode_output(b"".join(err_buf))
         if abort is not None and abort.is_set():
             _kill_tree(proc)
             return "ABORTED", "", ""
@@ -1348,8 +1419,7 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
             return None
         try:
             proc = subprocess.Popen(cmd, cwd=cdir, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True,
-                                    encoding="utf-8", errors="replace")
+                                    stderr=subprocess.PIPE)
         except Exception as e:  # noqa: BLE001
             return e
         if proc_box is not None:
@@ -1581,24 +1651,72 @@ def cmd_status_for_chat(chat_id=None):
     return base + extra
 
 
+def _model_providers(models):
+    """Provider adlarini model listesinden cikar, sirayla, tekrarsiz."""
+    seen = []
+    for m in models:
+        p = m.split("/", 1)[0]
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _model_list(args, chat_id):
+    """Sayfali + filtreli model listesi.
+
+    Canli test bulgusu: opencode 356 model donuyor, onceki surum ilk 80'i
+    gosterip "...(+276)" yaziyor ve geri kalana erisim yolu birakiyordu.
+    Artik her model bir sayfada gorunur; provider veya alt dize ile filtre
+   lenebilir: `/model list zenmux`, `/model list bunny`, `/model list zenmux 2`.
+    """
+    models = _opencode_models()
+    if not models:
+        return "Model listesi alinamadi. `opencode models` calismadi ya da bos dondu."
+    rest = [a for a in args if a]
+    page = 1
+    if rest and rest[-1].isdigit():
+        page = int(rest[-1])
+        rest.pop()
+    query = " ".join(rest).strip()
+    sel = models
+    if query:
+        q = query.lower()
+        sel = [m for m in models if q in m.lower()]
+        if not sel:
+            return ("Eslesme yok: '%s'\n\nProvider'lar: %s"
+                    % (query, ", ".join(_model_providers(models))))
+    total = max(1, (len(sel) + MODEL_PAGE_SIZE - 1) // MODEL_PAGE_SIZE)
+    page = max(1, min(page, total))
+    start = (page - 1) * MODEL_PAGE_SIZE
+    cur = _chat_model(chat_id)
+    lines = ["Modeller%s | sayfa %d/%d | toplam %d"
+             % (("  '%s'" % query) if query else "", page, total, len(sel))]
+    for m in sel[start:start + MODEL_PAGE_SIZE]:
+        lines.append("%s %s" % ("*" if m == cur else " ", m))
+    suffix = (" " + query) if query else ""
+    nav = []
+    if page > 1:
+        nav.append("onceki: /model list%s %d" % (suffix, page - 1))
+    if page < total:
+        nav.append("sonraki: /model list%s %d" % (suffix, page + 1))
+    if nav:
+        lines.append("")
+        lines.append("   ".join(nav))
+    lines.append("Aktif: %s" % (cur or "(opencode varsayilani)"))
+    if not query:
+        lines.append("Filtre: /model list <provider veya arama>"
+                     "  -  orn. /model list opencode")
+    return "\n".join(lines)
+
+
 def cmd_model(text, chat_id):
     parts = text.strip().split()
     cur = _chat_model(chat_id) or "(opencode varsayilani)"
     if len(parts) == 1 or parts[1].lower() in ("current", "goster"):
-        return "Aktif model: %s\nDegistir: /model set <provider/model> | Liste: /model list" % cur
+        return ("Aktif model: %s\nDegistir: /model set <provider/model>\n"
+                "Liste: /model list   -   Filtre: /model list <provider|arama>" % cur)
     if parts[1].lower() == "list":
-        models = _opencode_models()
-        if not models:
-            return "Model listesi alinamadi."
-        cur_full = _chat_model(chat_id)
-        lines = []
-        for m in models[:80]:
-            mark = "*" if m == cur_full else " "
-            lines.append("%s %s" % (mark, m))
-        out = "Modeller (aktif *):\n" + "\n".join(lines)
-        if len(models) > 80:
-            out += "\n...(+%d)" % (len(models) - 80)
-        return out
+        return _model_list(parts[2:], chat_id)
     if parts[1].lower() == "set" and len(parts) >= 3:
         model = parts[2].strip()
         if "/" not in model:
@@ -1607,7 +1725,7 @@ def cmd_model(text, chat_id):
         warn = "" if (not known or model in known) else " (UYARI: listede yok, yine de kaydedildi)"
         _save_sess(chat_id, model=model)
         return "Model ayarlandi: %s%s. Sonraki sorular bununla calisir." % (model, warn)
-    return "Kullanim: /model | /model list | /model set <provider/model>"
+    return "Kullanim: /model | /model list [filtre] [sayfa] | /model set <provider/model>"
 
 
 def cmd_reset(chat_id):

@@ -262,11 +262,10 @@ _BIG = 300000
 
 def _big_output_proc():
     script = ("import sys;"
-              "sys.stdout.write('x'*%d);sys.stderr.write('y'*%d);"
-              "sys.stdout.flush();sys.stderr.flush()" % (_BIG, _BIG // 2))
+              "sys.stdout.buffer.write(b'x'*%d);sys.stderr.buffer.write(b'y'*%d);"
+              "sys.stdout.buffer.flush();sys.stderr.buffer.flush()" % (_BIG, _BIG // 2))
     return subprocess.Popen([sys.executable, "-c", script],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def test_wait_proc_drains_pipes(monkeypatch):
@@ -292,7 +291,7 @@ def test_wait_proc_abort_kills_child(monkeypatch):
     monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
     monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
     proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     ev = threading.Event()
     threading.Timer(1.0, ev.set).start()
     t0 = time.time()
@@ -306,7 +305,7 @@ def test_wait_proc_timeout(monkeypatch):
     monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
     monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
     proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     t0 = time.time()
     try:
         res, _, _ = B._wait_proc(proc, None, "111", timeout=2)
@@ -1059,3 +1058,215 @@ def test_error_body_is_read_once_and_cached(monkeypatch):
     # ikinci okuma bos donmemeli
     assert B._is_parse_error(e) is True
     assert B._read_error_body(e)["description"].startswith("Bad Request")
+
+
+def test_log_redacts_bot_token(capsys, monkeypatch):
+    """Log dosyalari paylasiliyor; token hicbir log satirina girmemeli."""
+    monkeypatch.setattr(B, "BOT_TOKEN", "123456:SUPERSECRETVALUE")
+    B.log("hata: https://api.telegram.org/bot123456:SUPERSECRETVALUE/getMe 401")
+    out = capsys.readouterr().out
+    assert "SUPERSECRETVALUE" not in out, out
+    assert "[REDACTED-BOT-TOKEN]" in out
+
+
+def test_log_keeps_ordinary_text(capsys):
+    B.log("IN chat=111 user=@t len=12")
+    assert "IN chat=111 user=@t len=12" in capsys.readouterr().out
+
+
+# ================================================================ /model list sayfalama
+# Canli test bulgusu (2026-09-29): opencode 356 model donuyor, bridge yalnizca
+# ilk 80'ini gosteriyordu ve "...(+276)" yazip birakiluyordu - geri kalana
+# erismenin HICBIR yolu yoktu.
+
+_MODELS = (["opencode/space-bunny-free", "opencode/muse-spark-1.3-contributor-free"]
+           + ["orcarouter/m%d" % i for i in range(124)]
+           + ["zenmux/z%d" % i for i in range(121)])
+
+
+def _patch_models(monkeypatch, models=None):
+    chosen = _MODELS if models is None else list(models)
+    monkeypatch.setattr(B, "_opencode_models", lambda: list(chosen))
+
+
+def test_model_list_first_page_is_paginated(monkeypatch):
+    _patch_models(monkeypatch)
+    out = B.cmd_model("/model list", "111")
+    total = (len(_MODELS) + B.MODEL_PAGE_SIZE - 1) // B.MODEL_PAGE_SIZE
+    assert "sayfa 1/%d" % total in out
+    assert "orcarouter/m0" in out
+    assert "sonraki" in out
+
+
+def test_model_list_all_models_are_reachable(monkeypatch):
+    """Her model bir sayfada gorunebilmeli (canli testin bulgusu)."""
+    _patch_models(monkeypatch)
+    total = (len(_MODELS) + B.MODEL_PAGE_SIZE - 1) // B.MODEL_PAGE_SIZE
+    seen = set()
+    for p in range(1, total + 1):
+        for line in B.cmd_model("/model list %d" % p, "111").split("\n"):
+            seen.update(t.strip("* ").strip() for t in line.split() if "/" in t)
+    missing = [m for m in _MODELS if m not in seen]
+    assert not missing, "erisilemeyen %d model: %s" % (len(missing), missing[:5])
+
+
+def test_model_list_page_out_of_range_clamps(monkeypatch):
+    _patch_models(monkeypatch)
+    total = (len(_MODELS) + B.MODEL_PAGE_SIZE - 1) // B.MODEL_PAGE_SIZE
+    assert "sayfa %d/%d" % (total, total) in B.cmd_model("/model list 999", "111")
+    assert "sayfa 1/%d" % total in B.cmd_model("/model list 0", "111")
+
+
+def test_model_list_filter_by_provider(monkeypatch):
+    _patch_models(monkeypatch)
+    out = B.cmd_model("/model list zenmux", "111")
+    n_zenmux = 121
+    exp = (n_zenmux + B.MODEL_PAGE_SIZE - 1) // B.MODEL_PAGE_SIZE
+    assert "sayfa 1/%d" % exp in out
+    assert "zenmux/z0" in out
+    assert "orcarouter/m0" not in out
+
+
+def test_model_list_filter_by_substring(monkeypatch):
+    _patch_models(monkeypatch)
+    out = B.cmd_model("/model list bunny", "111")
+    assert "opencode/space-bunny-free" in out
+    assert "orcarouter/m0" not in out
+
+
+def test_model_list_filter_with_page(monkeypatch):
+    _patch_models(monkeypatch)
+    exp = (121 + B.MODEL_PAGE_SIZE - 1) // B.MODEL_PAGE_SIZE
+    out = B.cmd_model("/model list zenmux 2", "111")
+    assert "sayfa 2/%d" % exp in out
+    assert "onceki" in out
+    assert "zenmux/z%d" % B.MODEL_PAGE_SIZE in out
+
+
+def test_model_list_no_match_lists_providers(monkeypatch):
+    _patch_models(monkeypatch)
+    out = B.cmd_model("/model list olmayanmodel", "111")
+    assert "Eslesme yok" in out
+    for p in ("opencode", "orcarouter", "zenmux"):
+        assert p in out
+
+
+def test_model_list_marks_active_model(monkeypatch):
+    _patch_models(monkeypatch)
+    B._save_sess("111", model="opencode/space-bunny-free")
+    try:
+        out = B.cmd_model("/model list", "111")
+        assert "* opencode/space-bunny-free" in out
+        assert "Aktif: opencode/space-bunny-free" in out
+    finally:
+        B._save_sess("111", model=None)
+
+
+def test_model_list_empty(monkeypatch):
+    _patch_models(monkeypatch, [])
+    assert "alinamadi" in B.cmd_model("/model list", "111")
+
+
+def test_model_list_is_ascii(monkeypatch):
+    """Kullaniciya giden metin ASCII kalsin (repo tutarliligi)."""
+    _patch_models(monkeypatch)
+    for cmd in ("/model list", "/model list zenmux 2", "/model list", "/model"):
+        out = B.cmd_model(cmd, "111")
+        assert all(ord(c) < 128 for c in out), "%s -> %r" % (cmd, out[:80])
+
+
+# ================================================================ Canli test bulgulari
+# 2026-09-29 gercek Telegram testi: opencode'in stdout'u iki sekilde bozuluyordu
+# ve TUM cevaplarda gorunuyordu.
+
+def test_clean_text_strips_ansi():
+    raw = "\x1b[0m> orchestrator -> model\n\x1b[91m\x1b[1mError:\x1b[0m You're out of credits"
+    out = B.clean_text(raw)
+    assert "\x1b" not in out, repr(out)
+    assert "Error:" in out and "out of credits" in out
+
+
+def test_clean_text_strips_osc_sequences():
+    """ESC ] ... BEL gibi OSC dizileri de atilmali."""
+    out = B.clean_text("\x1b]0;title\x07metin")
+    assert "\x07" not in out and "metin" in out
+
+
+def test_clean_text_keeps_normal_text():
+    assert B.clean_text("duz metin\nikinci satir") == "duz metin\nikinci satir"
+    assert B.clean_text("") == ""
+
+
+def test_clean_text_removes_nul():
+    assert B.clean_text("a\x00b") == "ab"
+
+
+def test_decode_output_utf8():
+    assert B.decode_output("merhaba".encode("utf-8")) == "merhaba"
+
+
+def test_decode_output_falls_back_to_cp1254():
+    """Canli test bulgusu: Windows'ta opencode Turkce karakterleri cp1254
+    ile yaziyor. Salt UTF-8 okunursa 'ğ' bozuluyor."""
+    raw = "desteğini doğruluyorum".encode("cp1254")
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+    assert B.decode_output(raw) == "desteğini doğruluyorum"
+
+
+def test_decode_output_cp1254_turkish_sentences():
+    for text in ("Sesli kontrol desteğini doğruluyorum", "ne çalışıyoruz?",
+                 "Türkçe ıİşğüöç", "Özet: 3 şey yaptı"):
+        assert B.decode_output(text.encode("cp1254")) == text
+
+
+def test_decode_output_empty():
+    assert B.decode_output(b"") == ""
+    assert B.decode_output("") == ""
+    assert B.decode_output(None) == ""
+
+
+def test_decode_output_never_raises():
+    """Bilinmeyen kodlama veya bozuk bayt: cokertme, hata degil."""
+    out = B.decode_output(b"\xff\xfe\x00\x81\x82")
+    assert isinstance(out, str) and out
+
+
+def test_outgoing_combines_clean_and_redact():
+    """Telegram'a giden her metin: ANSI temizle -> maskele."""
+    monkey = B.BOT_TOKEN
+    try:
+        B.BOT_TOKEN = "SECRET123456"
+        out = B._outgoing("\x1b[0m token: SECRET123456 \x1b[91m\nsk-abcdefghijklmnopqrstUVWX")
+        assert "\x1b" not in out
+        assert "SECRET123456" not in out
+        assert "sk-abcdefghijklmnopqrstUVWX" not in out
+    finally:
+        B.BOT_TOKEN = monkey
+
+
+def test_send_message_cleans_ansi_and_encoding(monkeypatch):
+    """Uctan uca: kirli opencode ciktisi gonderilirken temizlenir."""
+    sent = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: sent.append(p) or {"ok": True})
+    B.send_message("111", "\x1b[91mHata:\x1b[0m dosyayi bulamadim")
+    assert "\x1b" not in sent[0]["text"]
+    assert sent[0]["text"].startswith("Hata:")
+
+
+def test_wait_proc_decodes_bytes(monkeypatch):
+    """Alt surec bayt uretiyorsa da dogru cozulmeli (text=True yok)."""
+    monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    script = ("import sys;sys.stdout.buffer.write('de\u015fte\u011fini'.encode('cp1254'))")
+    proc = subprocess.Popen([sys.executable, "-c", script],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        res, out, err = B._wait_proc(proc, None, "111", timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert res == "ok"
+    assert "de" in out and "i" in out, repr(out)
+    assert "\ufffd" not in out, "cozulemeyen bayt kaldi"
