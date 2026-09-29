@@ -36,7 +36,8 @@ opencode-telegram/
 
 ## Global kurulum
 
-Herhangi bir makinede, bu paket tek basina da durabilir:
+Herhangi bir makinede, bu paket tek basina da durabilir. En kolay yol
+(`setup.bat` menu acar: kur / baslat / selftest):
 
 ```powershell
 .\scripts\install-global.ps1   # Windows: global opencode.json'a telegram MCP'yi ekler (backup'li)
