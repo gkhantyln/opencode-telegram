@@ -133,21 +133,28 @@ calistir. Ekstra port acmaya gerek yok (bridge Telegram'a outbound baglanir).
 - Bridge acilinca varsayilan chat'e "Kopru acildi" pingu gelir; gelmediyse
   bridge ayaga kalkmamis demektir.
 - `telegram-ops.md` kurali: secret/log/token Telegram'a gonderilmez.
+- **Izin ve soru butonlari.** Bir izin/soru mesaji belirli bir sohbete ait;
+  buton tiklandiginda mesajin kimligi beklenenle eslesmezse islem yapilmaz
+  ("bu mesaj artik guncel degil"). Soru menulerinde "Vazgec" butonu isi
+  durdurur; yanlis bir onay vermek istemiyorsaniz onu kullanin.
 
 ## BotFather komut listesi (opsiyonel)
 
-BotFather -> `/setcommands` ile su listeyi ekleyince Telegram komutlari onerir:
+Bridge acilista `setMyCommands` ile Telegram'in `/` menusunu kendisi doldurur
+(`TELEGRAM_SET_COMMANDS=0` ile kapatilir). Elle girmek istersen
+**BotFather -> `/setcommands`**:
 
 ```
-durum - Proje + oturum durumu
-sor - Orchestrator'a sor
-onay - Onay/not birak (HOLD-xxx ile bekleyen isi calistir)
-abort - Calisan isi durdur
-reset - Oturumu sifirla
-model - Model gor/listele/degistir
-roster - Agent canlilik
-gelen - Okunmamis team-mailbox
 yardim - Komut listesi
+durum - Proje, oturum ve model durumu
+sor - Orchestrator'a soru veya gorev gonder
+onay - Onay / not birak
+abort - Calisan isi durdur
+reset - Telegram oturumunu sifirla
+model - Model gor / listele / degistir
+project - Proje listele / sec
+roster - Agent canlilik durumu
+gelen - Okunmamis team-mailbox
 ```
 
 ## Sorun giderme

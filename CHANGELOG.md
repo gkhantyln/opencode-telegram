@@ -1,5 +1,42 @@
 # Changelog — opencode-telegram
 
+## Unreleased (2.2.0)
+
+v0.26.1 incelemesi; alinan davranislar stdlib ile yeniden yazildi.
+Testler 45 -> 70.
+
+### Eklendi
+
+- **Telegram komut menusu otomatik kuruluyor.** Bridge acilista
+  `setMyCommands` cagirir. Once kullanici BotFather'a elle komut girmesi
+  gerekiyordu (`docs/KURULUM.md`) ve cogu kullanici yapmiyordu -> `/`
+  menusu bos kaliyordu. Kapatmak icin `TELEGRAM_SET_COMMANDS=0`.
+- **Kademeli streaming throttle.** Sabit 2 sn yerine sureye gore kademe:
+  <1 dk 1 sn, <5 dk 2 sn, <15 dk 5 sn, sonrasi 10 sn. Onceden 15
+  dakikalik bir is 450 gereksiz `editMessageText` cagiriyordu.
+- **Izin/soru butonlarinda iptal.** Soru menulerine "Vazgec (is
+  durdurulsun)" butonu eklendi; once yalnizca secenekler vardi ve
+  kullanici 30 dk bekleyip `/abort` atmak zorundaydi.
+- `TELEGRAM_API_MAX_RETRIES` ayari (varsayilan 3, 0 = hic tekrar yok).
+
+### Duzeltilen (hata)
+
+- **429 ve gecici 5xx tekrar denemiyordu.** `api()` tek `urlopen`
+  cagirip hatayi yutuyordu; Telegram rate limit'i (ve ara sira 502)
+  dogrudan cevabin sessizce kaybolmasina yol aciyordu. Artik
+  `parameters.retry_after` okunuyor, ustel backoff uygulaniyor.
+  400/401/403/404 ve **409** (baska bridge) kasitli olarak tekrar
+  edilmiyor.
+- **Bayat buton korumasi.** 30 dk boyunca eski bir izin mesajindaki
+  buton tiklanabiliyor ve yanlis oturuma onay verebiliyordu. Artik
+  butonun ait oldugu mesajin kimligi beklenenle eslesmezse islem
+  yapilmaz.
+- **Butonlar tek satira diziliyordu.** 8 secenekli bir soruda Telegram
+  8 butonu bir satira sigdiromaya calisiyordu. Artik 2 sutunlu izgara
+  + bosluk birakmadan dizilim.
+- `callback_data` 64 bayt limiti asilirsa Telegram mesaji sessizce
+  reddediyordu; artik kirpilir.
+
 ## Unreleased (2.1.0)
 
 Dogrulanmis kod incelemesi sonrasi P0/P1 duzeltmeleri. Detaylar: `GAP-PLAN.md`.

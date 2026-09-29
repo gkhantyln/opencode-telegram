@@ -5,6 +5,7 @@ Calistir: pytest opencode-telegram/tests/test_bridge.py
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import threading
 import time
 
 import pytest
+
 
 TMP = tempfile.mkdtemp()
 os.environ["TEAM_MAILBOX_DIR"] = TMP
@@ -551,9 +553,319 @@ def test_cleanup_tg_files_by_age_and_count(monkeypatch):
 def test_send_message_chunks(monkeypatch):
     """4000 karakter ustu metin parcalara bolunmeli (Telegram siniri)."""
     sent = []
-    monkeypatch.setattr(B, "api", lambda m, p=None, timeout=45: sent.append((m, p)) or {"ok": True})
+    monkeypatch.setattr(B, "api", lambda m, p=None, timeout=45, max_retries=None: sent.append((m, p)) or {"ok": True})
     B.send_message("111", "y" * 9500)
     texts = [p["text"] for (m, p) in sent if m == "sendMessage"]
     assert len(texts) == 3, len(texts)
     assert all(len(t) <= 4000 for t in texts)
     assert "".join(texts) == "y" * 9500
+
+
+# ================================================================ B: setMyCommands
+# Telegram'in "/" komut menusunu bridge doldurur. Onceki surumde kullanici
+# BotFather'a elle komut girmesi gerekiyordu (KURULUM.md) ve cogu kullanic
+# yapmiyordu -> komutlar Telegram'da gorunmuyordu.
+
+def test_command_catalog_is_valid():
+    names = [c["command"] for c in B.TG_COMMANDS]
+    assert names, "komut listesi bos"
+    assert len(names) == len(set(names)), "komut adlari tekil degil: %s" % names
+    assert len(names) <= 100, "Telegram en fazla 100 komut kabul eder"
+    for c in B.TG_COMMANDS:
+        assert re.match(r"^[a-z0-9_]{1,32}$", c["command"]), c
+        assert 1 <= len(c["description"]) <= 256, c
+
+
+def test_command_catalog_covers_help():
+    """Katalog yardim metnindeki tum komutlari icermeli (iki kaynak ayrilmamali)."""
+    listed = {c["command"] for c in B.TG_COMMANDS}
+    for name in ("yardim", "durum", "sor", "onay", "abort", "reset", "model", "project"):
+        assert name in listed, "/%s yardimda var ama katalogda yok" % name
+
+
+def test_set_my_commands(monkeypatch):
+    calls = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: calls.append((m, p)) or {"ok": True})
+    assert B.set_my_commands() is True
+    assert calls and calls[0][0] == "setMyCommands"
+    cmds = calls[0][1]["commands"]
+    assert any(c["command"] == "yardim" for c in cmds)
+    assert all(set(c) == {"command", "description"} for c in cmds)
+
+
+def test_set_my_commands_disabled(monkeypatch):
+    monkeypatch.setattr(B, "SET_COMMANDS", False)
+    calls = []
+    monkeypatch.setattr(B, "api", lambda *a, **k: calls.append(a) or {"ok": True})
+    assert B.set_my_commands() is False
+    assert not calls
+
+
+def test_set_my_commands_never_breaks_startup(monkeypatch):
+    """setMyCommands basarisiz olursa bridge yine acilmali."""
+    def boom(*a, **k):
+        raise RuntimeError("ag yok")
+    monkeypatch.setattr(B, "api", boom)
+    assert B.set_my_commands() is False
+
+
+# ================================================================ C: kademeli throttle
+# Sabit 2 sn yerine sureye gore kademeli: kisa isler akici, uzun isler rate
+
+def test_progressive_throttle_tiers():
+    assert B.progressive_throttle(0) == 1.0
+    assert B.progressive_throttle(59) == 1.0
+    assert B.progressive_throttle(61) == 2.0
+    assert B.progressive_throttle(4 * 60) == 2.0
+    assert B.progressive_throttle(6 * 60) == 5.0
+    assert B.progressive_throttle(14 * 60) == 5.0
+    assert B.progressive_throttle(16 * 60) == 10.0
+    assert B.progressive_throttle(600 * 60) == 10.0
+
+
+def test_progressive_throttle_never_negative():
+    assert B.progressive_throttle(-5) == 1.0
+
+
+# ================================================================ D: 429 / 5xx retry
+
+def test_retry_wait_429_honors_retry_after():
+    assert B._retry_wait(429, {"parameters": {"retry_after": 7}}, 0) == 7.0
+    assert B._retry_wait(429, {"parameters": {"retry_after": 999}}, 0) == B.API_RETRY_AFTER_CAP
+
+
+def test_retry_wait_429_parses_description():
+    body = {"description": "Too Many Requests: retry after 12"}
+    assert B._retry_wait(429, body, 0) == 12.0
+
+
+def test_retry_wait_429_fallback_when_unknown():
+    assert B._retry_wait(429, {}, 0) == B.API_RETRY_BASE
+    assert B._retry_wait(429, {"parameters": {}}, 3) == B.API_RETRY_BASE
+
+
+def test_retry_wait_transient_5xx_backoff():
+    assert B._retry_wait(502, {}, 0) == B.API_RETRY_BASE
+    assert B._retry_wait(502, {}, 1) == pytest.approx(B.API_RETRY_BASE * 2)
+    assert B._retry_wait(503, {}, 20) == B.API_RETRY_CAP
+    for code in (500, 502, 503, 504):
+        assert B._retry_wait(code, {}, 0) is not None, code
+
+
+def test_retry_wait_no_retry_for_permanent_errors():
+    for code in (400, 401, 403, 404, 409):
+        assert B._retry_wait(code, {}, 0) is None, code
+
+
+def _http_error(code, body=None):
+    import io
+    import urllib.error
+    raw = json.dumps(body or {"ok": False}).encode("utf-8")
+    return urllib.error.HTTPError("u", code, "err", {}, io.BytesIO(raw))
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._raw = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_api_retries_429_then_succeeds(monkeypatch):
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    def fake(req, timeout=None):
+        n.append(1)
+        if len(n) == 1:
+            raise _http_error(429, {"ok": False, "error_code": 429,
+                                    "parameters": {"retry_after": 3}})
+        return _FakeResp({"ok": True, "result": {"message_id": 7}})
+
+    monkeypatch.setattr(B.urllib.request, "urlopen", fake)
+    r = B.api("sendMessage", {"chat_id": "1", "text": "x"})
+    assert r["result"]["message_id"] == 7
+    assert len(n) == 2
+
+
+def test_api_retries_transient_5xx(monkeypatch):
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    def fake(req, timeout=None):
+        n.append(1)
+        if len(n) < 3:
+            raise _http_error(502, {"ok": False})
+        return _FakeResp({"ok": True})
+
+    monkeypatch.setattr(B.urllib.request, "urlopen", fake)
+    assert B.api("getMe", {})["ok"] is True
+    assert len(n) == 3
+
+
+def test_api_gives_up_after_max_retries(monkeypatch):
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    monkeypatch.setattr(B.urllib.request, "urlopen",
+                        lambda req, timeout=None: (n.append(1), _raise(_http_error(502)))[1])
+    with pytest.raises(Exception):
+        B.api("sendMessage", {}, max_retries=2)
+    assert len(n) == 3, "1 deneme + 2 tekrar bekleniyordu, %d oldu" % len(n)
+
+
+def test_api_does_not_retry_409(monkeypatch):
+    """409 = baska bir bridge ayni botta. Tekrarlanirsa durum bulaniklasir."""
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    monkeypatch.setattr(B.urllib.request, "urlopen",
+                        lambda req, timeout=None: (n.append(1), _raise(_http_error(409)))[1])
+    with pytest.raises(Exception):
+        B.api("getUpdates", {}, max_retries=3)
+    assert len(n) == 1, "409 tekrar denenmemeli, %d deneme yapildi" % len(n)
+
+
+def test_api_does_not_retry_401(monkeypatch):
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    monkeypatch.setattr(B.urllib.request, "urlopen",
+                        lambda req, timeout=None: (n.append(1), _raise(_http_error(401)))[1])
+    with pytest.raises(Exception):
+        B.api("getMe", {}, max_retries=3)
+    assert len(n) == 1
+
+
+def test_api_retries_network_error(monkeypatch):
+    import urllib.error
+    n = []
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+
+    def fake(req, timeout=None):
+        n.append(1)
+        if len(n) < 3:
+            raise urllib.error.URLError("baglanti yok")
+        return _FakeResp({"ok": True})
+
+    monkeypatch.setattr(B.urllib.request, "urlopen", fake)
+    assert B.api("getMe", {})["ok"] is True
+    assert len(n) == 3
+
+
+def _raise(exc):
+    raise exc
+
+
+# ================================================================ F: buton yapisi
+# Onceki surumde butonlar tek satirda diziliyordu: 8 secenekli bir soruda
+# Telegram 8 butonu bir satira sigdiromaya calisiyordu. Artizgara + iptal.
+
+def test_send_buttons_grid_layout(monkeypatch):
+    calls = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: calls.append((m, p)) or {"result": {"message_id": 3}})
+    B.send_buttons("111", "sec", [("A", "frm:x:0"), ("B", "frm:x:1"), ("C", "frm:x:2")],
+                   cols=2, cancel=("Vazgec", "frm:x:cancel"))
+    kb = calls[0][1]["reply_markup"]["inline_keyboard"]
+    assert [len(r) for r in kb] == [2, 1, 1], kb
+    assert kb[0][0]["callback_data"] == "frm:x:0"
+    assert kb[-1][0]["callback_data"] == "frm:x:cancel"
+    assert kb[-1][0]["text"] == "Vazgec"
+
+
+def test_send_buttons_even_grid_no_trailing_gap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: calls.append((m, p)) or {"result": {"message_id": 3}})
+    B.send_buttons("111", "s", [("A", "a"), ("B", "b"), ("C", "c"), ("D", "d")], cols=2)
+    kb = calls[0][1]["reply_markup"]["inline_keyboard"]
+    assert [len(r) for r in kb] == [2, 2], kb
+
+
+def test_permission_menu_is_one_row(monkeypatch):
+    """Izin menusu 3 buton + cols=3 -> tek satir (gercek cagri noktasi)."""
+    calls = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: calls.append((m, p)) or {"result": {"message_id": 3}})
+    B.send_buttons("111", "s", [("Onayla (1 kez)", "prm:1:once"),
+                                ("Her zaman", "prm:1:always"),
+                                ("Reddet", "prm:1:reject")], cols=3)
+    kb = calls[0][1]["reply_markup"]["inline_keyboard"]
+    assert [len(r) for r in kb] == [3], kb
+    assert [b["text"] for b in kb[0]] == ["Onayla (1 kez)", "Her zaman", "Reddet"]
+
+
+def test_send_buttons_callback_data_limit(monkeypatch):
+    """Telegram callback_data limiti 64 bayt; asarsa mesaj gonderilmez."""
+    calls = []
+    monkeypatch.setattr(B, "api",
+                        lambda m, p=None, timeout=45, max_retries=None: calls.append((m, p)) or {"result": {"message_id": 3}})
+    B.send_buttons("111", "s", [("A" * 40, "frm:%s:0" % ("z" * 120))])
+    for row in calls[0][1]["reply_markup"]["inline_keyboard"]:
+        for b in row:
+            assert len(b["callback_data"].encode("utf-8")) <= 64, len(b["callback_data"])
+
+
+def test_form_cancel_button_stops_run(monkeypatch):
+    """Soruyu reddetmek = isi durdurmak. Yari birakilmis soru birakmamali."""
+    B.pending_forms.clear()
+    B.pending_forms["F-001"] = {"session": "s1", "chat": "111", "formID": "f9",
+                                "key": "renk", "options": ["a", "b"],
+                                "ts": time.time(), "msg": 5}
+    acted = []
+
+    class _C:
+        def interrupt(self, s):
+            acted.append(("interrupt", s))
+
+    monkeypatch.setattr(B, "_serve", lambda *a, **k: _C())
+    seen, edits = [], []
+    monkeypatch.setattr(B, "answer_callback", lambda *a, **k: seen.append(a))
+    monkeypatch.setattr(B, "edit_message", lambda c, m, t: edits.append((c, m, t)) or True)
+    B.handle_callback({"id": "cb9", "data": "frm:F-001:cancel", "from": {"id": 111},
+                       "message": {"message_id": 5}})
+    assert "F-001" not in B.pending_forms
+    assert acted == [("interrupt", "s1")], acted
+    assert seen and seen[0][0] == "cb9"
+    assert edits and "vazgec" in edits[0][2].lower()
+
+
+def test_stale_callback_is_rejected(monkeypatch):
+    """Eski mesajdaki buton artik gecerli degil (E: bayat buton korumasi)."""
+    B.pending_perms.clear()
+    B.pending_perms["perm-1"] = {"session": "s1", "chat": "111", "msg": 99,
+                                 "ts": time.time()}
+    seen = []
+    monkeypatch.setattr(B, "answer_callback", lambda *a, **k: seen.append(a) or None)
+    monkeypatch.setattr(B, "_serve", lambda *a, **k: (_ for _ in ()).throw(AssertionError("serve cagrilmamali")))
+    B.handle_callback({"id": "cbx", "data": "prm:perm-1:once", "from": {"id": 111},
+                       "message": {"message_id": 5}})
+    assert seen, "callback cevapsiz kalmamali"
+    assert "guncel" in seen[0][1].lower(), seen[0][1]
+    assert "perm-1" in B.pending_perms, "gecersiz buton kaydi yutmemeli"
+
+
+def test_current_callback_still_works(monkeypatch):
+    """Mesaj eslesiyorsa buton normal calismali (regresyon)."""
+    B.pending_perms.clear()
+    B.pending_perms["perm-2"] = {"session": "s1", "chat": "111", "msg": 99,
+                                 "ts": time.time()}
+    replied = []
+
+    class _C:
+        def reply_permission(self, s, r, d):
+            replied.append((s, r, d))
+
+    monkeypatch.setattr(B, "_serve", lambda *a, **k: _C())
+    monkeypatch.setattr(B, "answer_callback", lambda *a, **k: None)
+    monkeypatch.setattr(B, "edit_message", lambda c, m, t: True)
+    B.handle_callback({"id": "cby", "data": "prm:perm-2:always", "from": {"id": 111},
+                       "message": {"message_id": 99}})
+    assert replied == [("s1", "perm-2", "always")], replied
+    assert "perm-2" not in B.pending_perms

@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -165,13 +166,86 @@ def log(*a):
 
 API = "https://api.telegram.org/bot%s/%s"
 
+# Retry politikasi (GAP-06). Gecici sunucu hatalari (5xx) ve Telegram'in rate
+# limit'i (429) gecicidir; 400/401/403/404/409 kalicidir ve TEKRARLANMAZ.
+# 409 ozel: baska bir bridge ayni botta demektir, tekrar denemek durumu
+# bulaniklastirir (main_loop bunu ozel mesajla yazar).
+API_RETRY_STATUSES = (500, 502, 503, 504)
+try:
+    API_MAX_RETRIES = max(0, int(env("TELEGRAM_API_MAX_RETRIES", "3")))
+except ValueError:
+    API_MAX_RETRIES = 3
+API_RETRY_BASE = 0.6
+API_RETRY_CAP = 8.0
+API_RETRY_AFTER_CAP = 30.0
 
-def api(method, payload=None, timeout=45):
+
+def _read_error_body(e):
+    """HTTPError govdesini JSON olarak oku (retry_after burada gelir)."""
+    try:
+        raw = e.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _retry_wait(code, body, attempt):
+    """Tekrar bekleme suresi (sn). None = bu hata tekrar edilmemeli."""
+    if code == 429:
+        secs = 0.0
+        params = body.get("parameters")
+        if isinstance(params, dict):
+            try:
+                secs = float(params.get("retry_after") or 0)
+            except (TypeError, ValueError):
+                secs = 0.0
+        if secs <= 0:
+            m = re.search(r"retry after\s+(\d+)",
+                          str(body.get("description") or ""), re.IGNORECASE)
+            secs = float(m.group(1)) if m else 0.0
+        return min(secs if secs > 0 else API_RETRY_BASE, API_RETRY_AFTER_CAP)
+    if code in API_RETRY_STATUSES:
+        return min(API_RETRY_BASE * (2 ** max(0, attempt)), API_RETRY_CAP)
+    return None
+
+
+def api(method, payload=None, timeout=45, max_retries=None):
+    """Telegram Bot API cagrisi. 429 ve gecici 5xx icin ustel backoff'lu
+    tekrar dener; 400/401/403/404/409 gibi kalici hatalarda tekrar etmez."""
     url = API % (BOT_TOKEN, method)
     data = json.dumps(payload or {}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    n = API_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    attempt = 0
+    while True:
+        try:
+            req = urllib.request.Request(
+                url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:  # 4xx/5xx (URLError'un alt sinifi)
+            if attempt >= n:
+                raise
+            wait = _retry_wait(e.code, _read_error_body(e), attempt)
+            if wait is None:
+                raise
+            attempt += 1
+            log("api %s -> HTTP %s, %.1f sn sonra tekrar (%d/%d)"
+                % (method, e.code, wait, attempt, n))
+            time.sleep(wait)
+        except OSError as e:  # ag/soket hatasi: URLError, timeout, reset
+            if attempt >= n:
+                raise
+            attempt += 1
+            wait = min(API_RETRY_BASE * (2 ** (attempt - 1)), API_RETRY_CAP)
+            log("api %s ag hatasi: %s | %.1f sn sonra tekrar (%d/%d)"
+                % (method, str(e)[-120:], wait, attempt, n))
+            time.sleep(wait)
 
 
 # ---------- secret maskeleme (tum giden Telegram metni buradan gecer) ----------
@@ -252,11 +326,46 @@ def answer_callback(callback_id, text=""):
         pass
 
 
-def send_buttons(chat_id, text, buttons, reply_to=None):
-    """Inline butonlu mesaj. buttons: [(label, callback_data)]. Donus: message_id."""
-    markup = {"inline_keyboard": [[{"text": label, "callback_data": data}]
-                                  for (label, data) in buttons]}
-    payload = {"chat_id": chat_id, "text": _redact(text)[:4000], "reply_markup": markup}
+CALLBACK_DATA_MAX = 64  # Telegram'in kesin limiti; asarsa mesaj gonderilmez
+
+
+def _fit_callback(data):
+    """callback_data 64 bayta sigmiyorsa kisalt (Telegram mesaji reddeder)."""
+    raw = (data or "").encode("utf-8")
+    if len(raw) <= CALLBACK_DATA_MAX:
+        return data or ""
+    return raw[:CALLBACK_DATA_MAX - 3].decode("utf-8", "ignore") + "..."
+
+
+def button_grid(buttons, cols=2):
+    """Butonlari `cols` sutunlu izarga olusturur; bosluk birakilmaz.
+
+    Onceki surumde butonlar tek satira diziliyordu: 8 secenekli bir soruda
+    Telegram 8 butonu bir satira sigdiromaya calisiyordu.
+    """
+    rows, cur = [], []
+    for b in buttons:
+        cur.append({"text": b[0], "callback_data": _fit_callback(b[1])})
+        if len(cur) >= max(1, cols):
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+def send_buttons(chat_id, text, buttons, reply_to=None, cols=2, cancel=None):
+    """Inline butonlu mesaj.
+
+    buttons: [(label, callback_data)]
+    cancel:  (label, callback_data) -> en altta tek satira eklenir
+    Donus: message_id
+    """
+    rows = button_grid(buttons, cols=cols)
+    if cancel:
+        rows.append([{"text": cancel[0], "callback_data": _fit_callback(cancel[1])}])
+    payload = {"chat_id": chat_id, "text": _redact(text)[:4000],
+               "reply_markup": {"inline_keyboard": rows}}
     if reply_to is not None:
         payload["reply_to_message_id"] = reply_to
     res = api("sendMessage", payload)
@@ -508,6 +617,42 @@ HELP = (
     "Duz mesaj = /sor. Fotograf/belge gonderebilirsin (incelenir). "
     "Her chat'te ayni anda tek is calisir."
 )
+
+# ---------- Telegram komut menusu (GAP-B) ----------
+# Onceki surumde kullanici BotFather'a elle komut girmesi gerekiyordu
+# (docs/KURULUM.md) ve cogu kullanici yapmiyordu -> Telegram'in "/" menusu
+# bos kaliyordu. Bridge acilista `setMyCommands` ile doldurur.
+# Kurallar: isim kucuk harf/rakam/alt cizgi, 1-32 karakter; aciklama 1-256.
+SET_COMMANDS = env("TELEGRAM_SET_COMMANDS", "1") not in ("0", "false", "no")
+
+TG_COMMANDS = [
+    {"command": "yardim", "description": "Komut listesi"},
+    {"command": "durum", "description": "Proje, oturum ve model durumu"},
+    {"command": "sor", "description": "Orchestrator'a soru veya gorev gonder"},
+    {"command": "onay", "description": "Onay / not birak (HOLD-xxx ile isiyi calistir)"},
+    {"command": "abort", "description": "Calisan isi durdur"},
+    {"command": "reset", "description": "Telegram oturumunu sifirla"},
+    {"command": "model", "description": "Model gor / listele / degistir"},
+    {"command": "project", "description": "Proje listele / sec"},
+    {"command": "roster", "description": "Agent canlilik durumu"},
+    {"command": "gelen", "description": "Okunmamis team-mailbox mesajlari"},
+    {"command": "start", "description": "Baslangic / tanitim mesaji"},
+]
+
+
+def set_my_commands():
+    """Telegram'in "/" komut menusunu kur. Basarisiz olursa bridge yine acilir.
+
+    Donus: True gonderildi, False atlandi ya da gonderilemedi.
+    """
+    if not SET_COMMANDS:
+        return False
+    try:
+        api("setMyCommands", {"commands": TG_COMMANDS}, timeout=20)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log("setMyCommands atlandi: %s" % str(e)[-150:])
+        return False
 
 
 # ---------- opencode calistirma ----------
@@ -763,6 +908,27 @@ def _wait_proc(proc, abort, chat_id, timeout, reply_to=None):
 _serve_clients = {}
 
 
+def progressive_throttle(elapsed_sec):
+    """Sureye gore streaming guncelleme araligi (sn).
+
+    Sabit bir aralik yanlistir: 15 dakikalik bir iste 2 sn'de bir
+    `editMessageText` 450 gereksiz API cagrisi demektir. Kademeli:
+      <1 dk   -> 1 sn   (kisa isler akici gorunur)
+      <5 dk   -> 2 sn
+      <15 dk  -> 5 sn
+      >=15 dk -> 10 sn  (uzun islerde rate limit'e takilmaz)
+
+    """
+    t = max(0.0, float(elapsed_sec or 0))
+    if t < 60:
+        return 1.0
+    if t < 300:
+        return 2.0
+    if t < 900:
+        return 5.0
+    return 10.0
+
+
 def _serve(directory=None):
     """ServeClient (dizin bazinda cache); ulasilamiyorsa serve'i ayaga kaldirir."""
     global _serve_proc
@@ -937,7 +1103,7 @@ def run_opencode_serve(prompt, chat_id, from_label, files=None, abort=None,
                     mid = send_buttons(str(chat_id), txt, [
                         ("Onayla (1 kez)", "prm:%s:once" % rid),
                         ("Her zaman", "prm:%s:always" % rid),
-                        ("Reddet", "prm:%s:reject" % rid)], reply_to=reply_to)
+                        ("Reddet", "prm:%s:reject" % rid)], cols=3, reply_to=reply_to)
                     pending_perms[rid] = {"session": stored, "chat": str(chat_id),
                                           "msg": mid, "ts": time.time()}
             for f in c.list_forms(stored):
@@ -958,8 +1124,10 @@ def run_opencode_serve(prompt, chat_id, from_label, files=None, abort=None,
                                        (" (%s)" % snap[3]) if snap[3] else "",
                                        "\n".join("%d. %s" % (i + 1, o)
                                                  for i, o in enumerate(snap[2][:8]))),
-                                   [("Seç: %s" % o[:20], "frm:%s:%d" % (short, i))
+                                   [("Sec: %s" % o[:20], "frm:%s:%d" % (short, i))
                                     for i, o in enumerate(snap[2][:8])],
+                                   cols=2, cancel=("Vazgec (is durdurulsun)",
+                                                   "frm:%s:cancel" % short),
                                    reply_to=reply_to)
                 pending_forms[short]["msg"] = mid
             _prune_pending()
@@ -993,10 +1161,16 @@ def run_opencode_serve(prompt, chat_id, from_label, files=None, abort=None,
     sse_th = threading.Thread(target=_sse_loop, daemon=True)
     sse_th.start()
     last_flush = [0.0]
+    stream_start = time.time()
+
+    def stream_throttle():
+        return progressive_throttle(time.time() - stream_start)
 
     def _tick_stream():
         _tick()
-        if stream["msg_id"] and time.time() - last_flush[0] >= 2 and stream["buf"]:
+        # C: sabit 2 sn yerine kademeli throttle. Kisa isler akici kalir,
+        # uzun isler Telegram rate limit'ine takilmaz.
+        if stream["msg_id"] and time.time() - last_flush[0] >= stream_throttle() and stream["buf"]:
             last_flush[0] = time.time()
             cur = "".join(stream["buf"])[:3900]
             if cur != stream["edited"]:
@@ -1808,6 +1982,27 @@ def _flush_media(force=False):
             pass
 
 
+def _callback_msg_id(cb):
+    msg = cb.get("message") or {}
+    mid = msg.get("message_id")
+    return mid if isinstance(mid, int) else None
+
+
+def _stale_callback(cb_id, info, seen_msg):
+    """Butonun ait oldugu mesaj artik guncel mi? (bayat buton korumasi)
+
+    Eskiden eski bir izin/soru mesajindaki buton 30 dk boyunca tiklanabiliyor
+    ve yanlis oturuma onay verebiliyordu. Simdi mesaj kimligi eslesmezse
+    islem yapilmaz.
+    """
+    if seen_msg is None or info.get("msg") is None:
+        return False
+    if seen_msg == info.get("msg"):
+        return False
+    answer_callback(cb_id, "Bu mesaj artik guncel degil. Yenisini bekleyin.")
+    return True
+
+
 def handle_callback(cb):
     data = cb.get("data", "") or ""
     cb_id = cb.get("id", "")
@@ -1819,16 +2014,20 @@ def handle_callback(cb):
         log("DENIED-cb user=%s data=%.40s" % (label, data))
         return
     _prune_pending()
+    seen_msg = _callback_msg_id(cb)
     if data.startswith("prm:"):
         parts = data.split(":")
         if len(parts) != 3:
             answer_callback(cb_id, "Hatali buton.")
             return
         _, rid, decision = parts
-        info = pending_perms.pop(rid, None)
+        info = pending_perms.get(rid)
         if info is None or decision not in ("once", "always", "reject"):
             answer_callback(cb_id, "Istek suresi dolmus.")
             return
+        if _stale_callback(cb_id, info, seen_msg):
+            return
+        pending_perms.pop(rid, None)
         try:
             _serve().reply_permission(info["session"], rid, decision)
             answer_callback(cb_id, "Kaydedildi.")
@@ -1845,10 +2044,25 @@ def handle_callback(cb):
             answer_callback(cb_id, "Hatali buton.")
             return
         _, short, idx = parts
-        info = pending_forms.pop(short, None)
+        info = pending_forms.get(short)
         if info is None:
             answer_callback(cb_id, "Secim suresi dolmus.")
             return
+        if _stale_callback(cb_id, info, seen_msg):
+            return
+        if idx == "cancel":
+            # Soruyu reddetmek = isi durdurmak. Yarim birakilmis soru birakmamak
+            # icin (opencode cevap bekliyor olurdu) oturum kesiliyor.
+            pending_forms.pop(short, None)
+            try:
+                _serve().interrupt(info["session"])
+            except Exception:  # noqa: BLE001
+                pass
+            answer_callback(cb_id, "Vazgecildi.")
+            edit_message(info["chat"], info.get("msg"),
+                         "Soruldu, vazgecildi. Is durduruldu. /yardim")
+            return
+        pending_forms.pop(short, None)
         try:
             i = int(idx)
             value = info["options"][i]
@@ -2062,6 +2276,7 @@ def main_loop():
         sys.exit(3)
     import atexit as _atexit
     _atexit.register(_release_lock)
+    set_my_commands()
     log("telegram-bridge v%s basladi project=%s exec=%s backend=%s agent=%s model=%s allowed=%d kisi" % (
         VERSION, PROJECT_DIR, BRIDGE_EXEC, "serve" if SERVE_BACKEND else "cli",
         OPENCODE_AGENT, OPENCODE_MODEL or "default", len(ALLOWED)))
