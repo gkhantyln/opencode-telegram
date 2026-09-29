@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          for p in .env .opencode/mailbox/telegram_audit.log GAP-PLAN.md \
+          for p in .env .opencode/mailbox/telegram_audit.log GAP-PLAN.md PLAN.md \
                    bridge_live.log bridge_live.err audit.log; do
             if ! git check-ignore -q "$p"; then
               echo "::error:: $p ignore edilmiyor - sizinti riski"
@@ -55,6 +55,28 @@ jobs:
             exit 1
           fi
           echo "OK repoda izlenen log yok"
+
+      - name: Sır taramasi (public repo icin)
+        shell: bash
+        run: |
+          set -e
+          # Token / API anahtari desenleri. Eslesme varsa derlemeyi dusur.
+          if git grep -P -n '\b\d{8,10}:[A-Za-z0-9_-]{30,}\b' -- . \
+             | grep -v -e '\.example' -e 'test_' ; then
+            echo "::error:: bot token deseni bulundu"
+            exit 1
+          fi
+          if git grep -P -n 'sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[bpas]-[A-Za-z0-9-]{10,}|github_pat_[A-Za-z0-9_]{20,}' -- . \
+             | grep -v 'tests/' ; then
+            echo "::error:: API anahtari deseni bulundu"
+            exit 1
+          fi
+          # Birinin gizli yolu degil, kullanim yolu
+          if git grep -n -I -E '[A-Z]:\\\\Users\\\\[a-z0-9]' -- . ; then
+            echo "::error:: sabit kullanici yolu bulundu"
+            exit 1
+          fi
+          echo "OK sır taramasi temiz"
 
       - name: Surum tutarliligi (GAP-13)
         shell: bash
