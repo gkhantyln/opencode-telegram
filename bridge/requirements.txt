@@ -1,0 +1,2 @@
+# Bos dosya — bridge ve MCP stdlib-only'dir, pip paketi gerekmez.
+# Python 3.10+ yeterli. Testler icin (TG1-5): pip install pytest
