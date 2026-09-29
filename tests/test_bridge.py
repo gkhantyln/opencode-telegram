@@ -1175,6 +1175,182 @@ def test_model_list_is_ascii(monkeypatch):
         assert all(ord(c) < 128 for c in out), "%s -> %r" % (cmd, out[:80])
 
 
+def test_model_auto_clears_override(monkeypatch):
+    """`/model otomatik` sohbet gecersiz kilmasini kaldirir; boylece
+    gecilen oturumun kendi modeli kullanilir."""
+    B._save_sess("111", model="opencode/x")
+    try:
+        out = B.cmd_model("/model otomatik", "111")
+        assert "kaldir" in out
+        assert B._chat_model("111") == ""
+    finally:
+        B._save_sess("111", model=None)
+
+
+# ================================================================ /sessions listele + gecis
+# Canli test: bot her sohbet icin TEK oturum tutuyordu; listeleme ve gecis
+# hic yoktu. `opencode session list --format json` zaten id/title/updated/
+# created/directory donuyor.
+
+def _mk_sessions(n, directory=None, tag="aaaa"):
+    d = directory or TMP
+    return [{"id": "ses_%s%04d" % (tag, i), "title": "Telegram tg-111",
+             "updated": 1790709270000 - i * 3600000,
+             "created": 1790709270000 - i * 3600000,
+             "directory": d} for i in range(n)]
+
+
+def _patch_sessions(monkeypatch, sessions):
+    monkeypatch.setattr(B, "_session_list", lambda limit=50, cwd=None: list(sessions))
+    B._save_sess("111", clear_ses=True, model=None, project=None)
+
+
+def test_sessions_lists_all(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(3))
+    out = B.cmd_sessions("/sessions", "111")
+    for i in range(3):
+        assert "ses_%s%04d" % ("aaaa", i) in out or str(i + 1) in out
+    assert "toplam 3" in out
+
+
+def test_sessions_marks_active(monkeypatch):
+    s = _mk_sessions(3)
+    _patch_sessions(monkeypatch, s)
+    B._save_sess("111", ses=s[1]["id"])
+    try:
+        out = B.cmd_sessions("/sessions", "111")
+        assert ("* 2." in out), out
+    finally:
+        B._save_sess("111", clear_ses=True)
+
+
+def test_sessions_paging(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(40))
+    exp = (40 + B.SESSION_PAGE_SIZE - 1) // B.SESSION_PAGE_SIZE
+    out = B.cmd_sessions("/sessions", "111")
+    assert "sayfa 1/%d" % exp in out
+    assert "sonraki" in out
+    out2 = B.cmd_sessions("/sessions %d" % exp, "111")
+    assert "sayfa %d/%d" % (exp, exp) in out2
+    assert "onceki" in out2
+
+
+def test_every_session_is_reachable(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(40))
+    exp = (40 + B.SESSION_PAGE_SIZE - 1) // B.SESSION_PAGE_SIZE
+    seen = []
+    for p in range(1, exp + 1):
+        for line in B.cmd_sessions("/sessions %d" % p, "111").split("\n"):
+            if line.strip()[:1].isdigit() or line.strip()[:2] == "* ":
+                seen.append(line)
+    assert len(seen) == 40, "sayfalar toplami %d satir gosteriyor, 40 olmali" % len(seen)
+
+
+def test_sessions_filters_other_projects(monkeypatch):
+    """Oturumlar proje bazli; baska dizindekiler gosterilmemeli."""
+    mine = _mk_sessions(2, directory=TMP, tag="aaaa")
+    other = _mk_sessions(3, directory=os.path.join(TMP, "baska-proje"), tag="bbbb")
+    _patch_sessions(monkeypatch, mine + other)
+    out = B.cmd_sessions("/sessions", "111")
+    assert "toplam 2" in out
+    assert "ses_bbbb" not in out
+
+
+def test_sessions_switch(monkeypatch):
+    s = _mk_sessions(3)
+    _patch_sessions(monkeypatch, s)
+    out = B.cmd_sessions("/sessions ac 3", "111")
+    assert B._sess_entry("111").get("ses") == s[2]["id"]
+    assert "degistirildi" in out
+
+
+def test_sessions_switch_out_of_range(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(2))
+    assert "1-2" in B.cmd_sessions("/sessions ac 9", "111")
+    assert B._sess_entry("111").get("ses") is None
+
+
+def test_sessions_switch_refuses_while_busy(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(2))
+    ev = threading.Event()
+    fake = threading.Thread(target=lambda: ev.wait(5))
+    fake.start()
+    B._inflight["111"] = {"thread": fake, "abort": threading.Event(), "box": {}}
+    try:
+        assert "abort" in B.cmd_sessions("/sessions ac 1", "111").lower()
+        assert B._sess_entry("111").get("ses") is None
+    finally:
+        ev.set(); fake.join(); B._inflight.pop("111", None)
+
+
+def test_sessions_new_does_not_delete_old(monkeypatch):
+    """`/sessions yeni` eski oturumu SILMEZ (geri donulebilir)."""
+    s = _mk_sessions(2)
+    _patch_sessions(monkeypatch, s)
+    B._save_sess("111", ses=s[0]["id"])
+    try:
+        out = B.cmd_sessions("/sessions yeni", "111")
+        assert B._sess_entry("111").get("ses") is None
+        assert "SILINMADI" in out
+    finally:
+        B._save_sess("111", clear_ses=True)
+
+
+def test_sessions_switch_to_active_is_noop(monkeypatch):
+    s = _mk_sessions(2)
+    _patch_sessions(monkeypatch, s)
+    B._save_sess("111", ses=s[0]["id"])
+    try:
+        assert "Zaten" in B.cmd_sessions("/sessions ac 1", "111")
+    finally:
+        B._save_sess("111", clear_ses=True)
+
+
+def test_sessions_info(monkeypatch):
+    s = _mk_sessions(2)
+    _patch_sessions(monkeypatch, s)
+    B._save_sess("111", ses=s[0]["id"], model="opencode/x")
+    try:
+        out = B.cmd_sessions("/sessions bilgi", "111")
+        assert s[0]["id"] in out
+        assert "opencode/x" in out
+        assert "olusturma" in out
+    finally:
+        B._save_sess("111", clear_ses=True, model=None)
+
+
+def test_sessions_info_without_active(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(1))
+    B._save_sess("111", clear_ses=True)
+    assert "Aktif oturum yok" in B.cmd_sessions("/sessions bilgi", "111")
+
+
+def test_sessions_empty(monkeypatch):
+    _patch_sessions(monkeypatch, [])
+    out = B.cmd_sessions("/sessions", "111")
+    assert "bulunamadi" in out
+
+
+def test_sessions_usage(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(1))
+    out = B.cmd_sessions("/sessions zzz", "111")
+    assert "/sessions ac" in out and "/sessions yeni" in out
+
+
+def test_sessions_output_is_ascii(monkeypatch):
+    _patch_sessions(monkeypatch, _mk_sessions(20))
+    for cmd in ("/sessions", "/sessions 2", "/sessions ac 99", "/sessions yeni",
+                "/sessions bilgi", "/sessions zzz"):
+        out = B.cmd_sessions(cmd, "111")
+        assert all(ord(c) < 128 for c in out), "%s -> %r" % (cmd, out[:90])
+
+
+def test_sessions_command_registered():
+    """Komut menusunde gorunmeli."""
+    assert any(c["command"] == "sessions" for c in B.TG_COMMANDS)
+    assert "/sessions" in B.HELP
+
+
 # ================================================================ Canli test bulgulari
 # 2026-09-29 gercek Telegram testi: opencode'in stdout'u iki sekilde bozuluyordu
 # ve TUM cevaplarda gorunuyordu.

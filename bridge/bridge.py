@@ -802,7 +802,8 @@ HELP = (
     "/abort — calisan isi durdur\n"
     "/reset — Telegram oturumunu sifirla (yeni oturum acar)\n"
     "/project — proje listele/sec (cok projeli kullanimda)\n"
-    "/model — aktif model | /model list [filtre] [sayfa] | /model set <provider/model>\n"
+    "/model — aktif model | /model list [filtre] [sayfa] | /model set <p/m>\n"
+    "/sessions [sayfa] — oturum listesi | /sessions ac <no> gec | /sessions yeni\n"
     "/yardim — bu liste\n\n"
     "Duz mesaj = /sor. Fotograf/belge gonderebilirsin (incelenir). "
     "Her chat'te ayni anda tek is calisir."
@@ -823,6 +824,7 @@ TG_COMMANDS = [
     {"command": "abort", "description": "Calisan isi durdur"},
     {"command": "reset", "description": "Telegram oturumunu sifirla"},
     {"command": "model", "description": "Model gor / listele / degistir"},
+    {"command": "sessions", "description": "Oturumlari listele / gec / yeni olustur"},
     {"command": "project", "description": "Proje listele / sec"},
     {"command": "roster", "description": "Agent canlilik durumu"},
     {"command": "gelen", "description": "Okunmamis team-mailbox mesajlari"},
@@ -899,24 +901,33 @@ def _save_session(chat_id, ses_id):
     _save_sess(chat_id, ses=ses_id)
 
 
-def _save_sess(chat_id, ses=None, model=None, clear_ses=False, project=None):
+_UNSET = object()
+
+
+def _save_sess(chat_id, ses=_UNSET, model=_UNSET, clear_ses=False, project=_UNSET):
+    """Oturum kaydini guncelle.
+
+    Varsayilan `_UNSET`: parametre verilmedigi durumda o alan DEGISTIRILMEZ.
+    `None` verilirse o alan TEMIZLENIR. Onceki imzada `None` "dokunma" demekti,
+    bu yuzden `/model otomatik` gecersiz kilmayi kaldiramiyordu.
+    """
     try:
         with _aj.tx(SESSIONS_FILE):
             m = _load_sessions()
             ent = _sess_entry(chat_id)
             if clear_ses:
                 ent.pop("ses", None)
-            elif ses is not None:
+            elif ses is not _UNSET:
                 if ses:
                     ent["ses"] = ses
                 else:
                     ent.pop("ses", None)
-            if model is not None:
+            if model is not _UNSET:
                 if model:
                     ent["model"] = model
                 else:
                     ent.pop("model", None)
-            if project is not None:
+            if project is not _UNSET:
                 if project:
                     ent["project"] = project
                 else:
@@ -961,25 +972,34 @@ def _opencode_models():
     return _models_cache["list"]
 
 
-def _newest_session(since_ms=0, cwd=None):
-    """Local `session list` (model harcamaz). since_ms sonrasi en yeni oturumu doner."""
-    cmd, _ = _opencode_cmd(["session", "list", "--format", "json", "-n", "5"])
+def _session_list(limit=50, cwd=None):
+    """opencode oturumlarini JSON olarak listele (yeni once).
+
+    Dizi dondurur: [{'id','title','created','updated','directory'}]
+    Hata durumunda bos liste; cagiran taraf bunu kullaniciya soyler.
+    """
+    cmd, _ = _opencode_cmd(["session", "list", "--format", "json", "-n", str(limit)])
     if cmd is None:
-        return None
+        return []
     try:
-        p = subprocess.run(cmd, cwd=cwd or PROJECT_DIR, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=60)
+        p = subprocess.run(cmd, cwd=cwd or PROJECT_DIR, capture_output=True, timeout=60)
         if p.returncode != 0 or not p.stdout.strip():
-            return None
-        sessions = json.loads(p.stdout)
-        if since_ms:
-            fresh = [s for s in sessions if int(s.get("created", 0)) >= since_ms]
-            if fresh:
-                return fresh[0].get("id")
-            return None
-        return sessions[0].get("id") if sessions else None
+            return []
+        data = json.loads(decode_output(p.stdout))
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict) and d.get("id")]
     except Exception:
-        return None
+        return []
+
+
+def _newest_session(since_ms=0, cwd=None):
+    """Local `session list` (model harcamaz). since_ms sonrasi en yeni oturum."""
+    for s in _session_list(5, cwd or PROJECT_DIR):
+        if since_ms and int(s.get("created", 0)) < since_ms:
+            return None
+        return s.get("id")
+    return None
 
 
 def _debug_log(text):
@@ -1725,7 +1745,142 @@ def cmd_model(text, chat_id):
         warn = "" if (not known or model in known) else " (UYARI: listede yok, yine de kaydedildi)"
         _save_sess(chat_id, model=model)
         return "Model ayarlandi: %s%s. Sonraki sorular bununla calisir." % (model, warn)
-    return "Kullanim: /model | /model list [filtre] [sayfa] | /model set <provider/model>"
+    if parts[1].lower() in ("otomatik", "auto", "session"):
+        # Sohbet gecersiz kilmasi kalksin: gecilen oturumun kendi modeli
+        # kullanilsin (/sessions ile oturum degistirirken lazim).
+        _save_sess(chat_id, model=None)
+        return ("Model gecersiz kilmasi kaldirildi. Bundan sonra aktif oturumun "
+                "kendi modeli kullanilir. Geri almak: /model set <provider/model>")
+    return "Kullanim: /model | /model list [filtre] [sayfa] | /model set <p/m> | /model otomatik"
+
+
+# ---------- oturum listeleme ve gecis (/sessions) ----------
+
+SESSION_PAGE_SIZE = max(5, int(env("TELEGRAM_SESSION_PAGE_SIZE", "15") or 15))
+
+
+def _tshort(ms):
+    """Epoch ms -> '29.09 22:14'."""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).strftime("%d.%m %H:%M")
+    except Exception:
+        return "?"
+
+
+def _sessions_for_chat(chat_id, limit=60):
+    """Bu sohbetin projesine ait oturumlar (yeni once).
+
+    Oturumlar proje bazlidir: `directory` eslesmeyenler gosterilmez, aksi
+    halde baska bir projedeki oturuma gecilir ve ajan yanlis yerde calisir.
+    """
+    cdir = os.path.normcase(os.path.abspath(_chat_dir(chat_id)))
+    out = []
+    for s in _session_list(limit, _chat_dir(chat_id)):
+        d = s.get("directory")
+        if d and os.path.normcase(os.path.abspath(d)) != cdir:
+            continue
+        out.append(s)
+    return out
+
+
+def _sessions_page(items, page):
+    total = max(1, (len(items) + SESSION_PAGE_SIZE - 1) // SESSION_PAGE_SIZE)
+    page = max(1, min(int(page), total))
+    start = (page - 1) * SESSION_PAGE_SIZE
+    return page, total, items[start:start + SESSION_PAGE_SIZE]
+
+
+def cmd_sessions(text, chat_id):
+    """`/sessions` — listele, gec, yeni olustur, bilgi gor.
+
+    Canli test bulgusu: bridge her sohbet icin tek oturum tutuyordu, listeleme
+    ve gecis hic yokti. Gecis etkin oturumu silmez.
+    """
+    parts = text.strip().split()
+    cur = _sess_entry(chat_id).get("ses")
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].isdigit()):
+        return _sessions_show(chat_id, int(parts[1]) if len(parts) == 2 else 1, cur)
+    act = parts[1].lower()
+    if act == "ac" and len(parts) >= 3 and parts[2].isdigit():
+        n = int(parts[2])
+        items = _sessions_for_chat(chat_id)
+        if not items:
+            return "Bu proje icin oturum bulunamadi."
+        if n < 1 or n > len(items):
+            return "Numara 1-%d araliginda olmali (/sessions ile listele)." % len(items)
+        if _is_busy(chat_id):
+            return "Once /abort ile calisan isi durdur."
+        target = items[n - 1]
+        sid = target.get("id")
+        if sid == cur:
+            return "Zaten bu oturum aktif (#%d)." % n
+        _save_sess(chat_id, clear_ses=True)
+        _save_sess(chat_id, ses=sid)
+        return ("Oturum degistirildi: #%d  %s\n  id: %s\n\n"
+                "Sonraki mesajlar bu oturumda devam eder. Eski oturum SILINMADI."
+                % (n, _tshort(target.get("updated")), sid))
+    if act == "yeni":
+        if _is_busy(chat_id):
+            return "Once /abort ile calisan isi durdur."
+        _save_sess(chat_id, clear_ses=True)
+        return ("Yeni oturum modu. Eski oturum SILINMADI; /sessions ile geri "
+                "donebilirsin.\nSonraki mesaj yeni bir oturum acar.")
+    if act == "bilgi":
+        return _sessions_info(chat_id, cur)
+    if act == "sil":
+        return cmd_reset(chat_id)
+    return ("Kullanim:\n"
+            "  /sessions [sayfa]      oturumlari listele\n"
+            "  /sessions ac <no>     listelenen oturuma gec\n"
+            "  /sessions yeni        yeni oturum modu (eski silinmez)\n"
+            "  /sessions bilgi       aktif oturum detayi\n"
+            "  /sessions sil         aktif oturumu sil (= /reset)")
+
+
+def _sessions_show(chat_id, page, cur):
+    items = _sessions_for_chat(chat_id)
+    if not items:
+        return ("Oturum bulunamadi. Proje: %s\n"
+                "(`opencode session list` bu dizin icin bos dondu)"
+                % _chat_dir(chat_id))
+    page, total, chunk = _sessions_page(items, page)
+    first = (page - 1) * SESSION_PAGE_SIZE + 1
+    lines = ["Oturumlar | sayfa %d/%d | toplam %d" % (page, total, len(items))]
+    for i, s in enumerate(chunk, start=first):
+        sid = s.get("id", "")
+        mark = "*" if sid == cur else " "
+        lines.append("%s %d. %s  %s" % (mark, i, _tshort(s.get("updated")), sid[-16:]))
+    lines.append("")
+    nav = []
+    if page > 1:
+        nav.append("onceki: /sessions %d" % (page - 1))
+    if page < total:
+        nav.append("sonraki: /sessions %d" % (page + 1))
+    if nav:
+        lines.append("   ".join(nav))
+    lines.append("Gecis: /sessions ac <no>   -   yeni: /sessions yeni   -   sil: /sessions sil")
+    lines.append("Aktif: %s" % (cur or "(yok - ilk mesajda acilir)"))
+    return "\n".join(lines)
+
+
+def _sessions_info(chat_id, cur):
+    if not cur:
+        return "Aktif oturum yok. Ilk mesajda acilir."
+    info = next((s for s in _sessions_for_chat(chat_id) if s.get("id") == cur), None)
+    ent = _sess_entry(chat_id)
+    lines = ["Aktif oturum", "  id       : %s" % cur,
+             "  baslik   : %s" % ((info or {}).get("title") or "-")]
+    if info:
+        lines.append("  olusturma: %s" % _tshort(info.get("created")))
+        lines.append("  guncelleme: %s" % _tshort(info.get("updated")))
+    lines.append("  model    : %s"
+                 % (ent.get("model") or OPENCODE_MODEL or "(oturumun kendi modeli)"))
+    cdir = _chat_dir(chat_id)
+    stats = (_session_stats_serve(cur, cdir) if SERVE_BACKEND
+             else _session_stats(cur, cdir))
+    if stats:
+        lines.append("  " + stats)
+    return "\n".join(lines)
 
 
 def cmd_reset(chat_id):
@@ -1901,6 +2056,8 @@ def handle_text(chat_id, from_label, text, reply_to=None):
         return cmd_reset(chat_id), False
     if low == "/model" or low.startswith("/model ") or low.startswith("/model@"):
         return cmd_model(t, chat_id), False
+    if low == "/sessions" or low.startswith("/sessions ") or low.startswith("/sessions@"):
+        return cmd_sessions(t, chat_id), False
     if low == "/project" or low.startswith("/project ") or low.startswith("/project@"):
         return cmd_project(t, chat_id), False
     if low.startswith("/onay"):
