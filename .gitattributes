@@ -1,0 +1,25 @@
+# opencode-telegram - satir sonu kurallari
+# Windows-oncelikli ama Linux CI da kosuyor: `.sh` dosyalari LF kalmali,
+# yoksa `set -euo pipefail\r` Linux'ta hata verir. `.bat`/`.ps1` Windows'ta
+# CRLF bekler. Repoda LF, Windows'ta CRLF tutulur.
+
+* text=auto
+
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.py   text eol=lf
+*.txt  text eol=lf
+.json  text eol=lf
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# ikili dosyalar asla dokunulmaz
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.exe  binary
+*.zip  binary
