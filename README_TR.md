@@ -267,11 +267,28 @@ En çok dokunacağınız değişkenler:
 | `TELEGRAM_OPENCODE_AGENT` | `orchestrator` | Hangi ajan cevap verir |
 | `TELEGRAM_OPENCODE_MODEL` | opencode varsayılanı | Model geçersiz kılma |
 | `TELEGRAM_BRIDGE_EXEC` | `1` | `0` = yalnızca kuyruk, TUI orkestratörü çalışsın |
+| `TELEGRAM_MARKDOWN` | `1` | Cevabı MarkdownV2 olarak biçimle. `0` = her zaman düz metin |
+| `TELEGRAM_SET_COMMANDS` | `1` | `/` komut menüsünü açılışta kendiliğinden kur |
+| `TELEGRAM_API_MAX_RETRIES` | `3` | 429 ve geçici 5xx için tekrar sayısı. `0` = tekrar yok |
 | `TELEGRAM_DAILY_TOKEN_LIMIT` | `0` (kapalı) | Günlük token tavanı |
 | `TELEGRAM_FOLLOW_EDITS` | `0` | Mesajı düzenleyince tekrar çalıştır |
 | `TELEGRAM_PROJECTS` | — | Çok proje için `alias=yol,alias2=yol2` |
 | `TELEGRAM_SCHEDULE` | — | `09:00:/durum;18:00:/gelen` |
 | `TELEGRAM_DIGEST` | `0` | Bildirimleri tek tek yerine saatlik özetle |
+
+### Mesaj biçimleme
+
+Cevaplar Telegram MarkdownV2 olarak gönderilir; `**kalın**`, `_italik_`, `~~üstü çizili~~`,
+satır içi kod ve ```kod blokları``` telefonda biçimli görünür.
+
+İki ayrıntı bilmeye değer:
+
+- **Kod blokları asla yarıda kesilmez.** Cevap uzun olduğunda bölme blok ve satır
+  sınırlarında yapılır, böylece her mesaj tam ve geçerli bir kod bloğu içerir.
+  Ortadan kesmek Telegram'da bozuk kod gösterir.
+- **Biçimleme mesaj kaybettiremez.** Telegram bir mesajı biçim nedeniyle reddederse
+  (HTTP 400 + parse hatası) aynı içerik hemen düz metin olarak tekrar gönderilir.
+  Biçimlemeyi tamamen kapatmak için `TELEGRAM_MARKDOWN=0`.
 
 ---
 

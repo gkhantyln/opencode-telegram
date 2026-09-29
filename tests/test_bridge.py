@@ -493,18 +493,20 @@ def test_edited_message_dedup_when_enabled(monkeypatch):
     assert ran == ["soru v2"], ran
 
 
-def test_finish_streamed_chunks_overflow(monkeypatch):
-    """GAP-10: 4000 karakteri asan cevap kesilmemeli, parca parca gitmeli."""
-    edits, sends = [], []
-    monkeypatch.setattr(B, "edit_message",
-                        lambda c, m, t: edits.append(t) or True)
-    monkeypatch.setattr(B, "send_message", lambda c, t, reply_to=None: sends.append(t) or 1)
+def test_finish_streamed_chunks_overflow_plain(monkeypatch):
+    """Markdown kapaliyken tasma parca parca gonderilmeli (GAP-10)."""
+    monkeypatch.setattr(B, "MARKDOWN_ON", False)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    sent, edited = [], []
+    monkeypatch.setattr(B, "_edit_chunk", lambda c, m, t, pm=None: edited.append(t) or True)
+    monkeypatch.setattr(B, "_send_chunk",
+                        lambda c, t, m=None, reply_to=None: sent.append(t) or 1)
     long_out = "".join(chr(97 + (i % 26)) for i in range(11000))
-    B._finish_streamed("111", 42, long_out, "TG-001")
-    assert len(edits) == 1 and "TG-001" in edits[0]
-    assert len(edits[0]) <= 4000, "ilk mesaj limiti asti: %d" % len(edits[0])
-    assert "".join(sends) == long_out[3800:], "tasma kaybi: %d" % len("".join(sends))
-    assert all(len(s) <= 4000 for s in sends)
+    n = B._finish_streamed("111", 42, long_out, "TG-001")
+    assert n == 3, n
+    assert len(edited) == 1 and "[TG-001]" in edited[0]
+    assert all(len(t) <= 3900 for t in sent)
+    assert "".join(sent) == long_out[3900:], "tasma kaybi"
 
 
 def test_version_is_read_from_file():
@@ -869,3 +871,191 @@ def test_current_callback_still_works(monkeypatch):
                        "message": {"message_id": 99}})
     assert replied == [("s1", "perm-2", "always")], replied
     assert "perm-2" not in B.pending_perms
+
+
+# ================================================================ Markdown gonderimi
+
+def _capture_api(store):
+    def _api(method, payload=None, timeout=45, max_retries=None):
+        store.append((method, payload))
+        return {"ok": True, "result": {"message_id": 5}}
+    return _api
+
+
+def test_markdown_on_sends_parse_mode(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    store = []
+    monkeypatch.setattr(B, "api", _capture_api(store))
+    B._send_chunk("111", "Metin *kalın*", "MarkdownV2")
+    m, p = store[0]
+    assert m == "sendMessage"
+    assert p["parse_mode"] == "MarkdownV2"
+
+
+def test_markdown_off_sends_no_parse_mode(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", False)
+    store = []
+    monkeypatch.setattr(B, "api", _capture_api(store))
+    B._send_chunk("111", "Metin *kalın*", None)
+    assert "parse_mode" not in store[0][1]
+
+
+def test_parse_error_falls_back_to_plain(monkeypatch):
+    """Bicimleme hatasi mesaji KAYBETTIRMEMELI: duz metne dusmeli."""
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    store = []
+
+    def fake_api(method, payload=None, timeout=45, max_retries=None):
+        store.append(dict(payload))
+        if payload.get("parse_mode"):
+            raise _http_error(400, {"ok": False, "description":
+                                    "Bad Request: can't parse entities"})
+        return {"ok": True, "result": {"message_id": 5}}
+
+    monkeypatch.setattr(B, "api", fake_api)
+    mid = B._send_chunk("111", "Metin \\*kalin\\* ve nokta\\.", "MarkdownV2")
+    assert mid == 5
+    assert len(store) == 2, "parse_mode'lu bir, duz metin olarak bir denemeli"
+    assert "parse_mode" not in store[1]
+    assert "\\*" not in store[1]["text"], "kacis isaretleri duz metinde gorunmemeli"
+
+
+def test_non_parse_error_is_not_swallowed(monkeypatch):
+    """401/409 gibi kalici hatada sessizce duz metne dusulmemeli."""
+    monkeypatch.setattr(B, "time", B.time)
+    calls = []
+
+    def fake_api(method, payload=None, timeout=45, max_retries=None):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise _http_error(409, {"ok": False, "description": "Conflict"})
+        return {"ok": True, "result": {"message_id": 1}}
+
+    monkeypatch.setattr(B, "api", fake_api)
+    with pytest.raises(Exception):
+        B._send_chunk("111", "x", "MarkdownV2")
+    assert len(calls) == 1, "409 icin duz metne dusulmemeli"
+
+
+def test_md_pieces_never_splits_code_fence(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    body = "\n".join("satir %04d %s" % (i, "y" * 40) for i in range(300))
+    pieces = B._md_pieces("```py\n%s\n```" % body, limit=3900)
+    assert len(pieces) > 1
+    for text, mode in pieces:
+        assert mode == "MarkdownV2"
+        assert text.count("```") == 2, text[:60]
+        assert len(text) <= 3900
+
+
+def test_md_pieces_disabled_is_plain(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", False)
+    pieces = B._md_pieces("x" * 9000, limit=3900)
+    assert [m for _, m in pieces] == [None, None, None]
+    assert all(len(t) <= 3900 for t, _ in pieces)
+
+
+def test_footer_is_escaped_for_markdownv2(monkeypatch):
+    """`[TG-001]` etiketi MarkdownV2'de koseli ayrac olurdu; kacislanmali."""
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    out = B._with_footer("govde", "MarkdownV2", "TG-001")
+    assert out.endswith("\\[TG\\-001\\]"), out
+    plain = B._with_footer("govde", None, "TG-001")
+    assert plain == "govde\n\n[TG-001]"
+
+
+def test_finish_streamed_markdown_no_content_loss(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    sent, edited = [], []
+    monkeypatch.setattr(B, "_send_chunk",
+                        lambda c, t, m=None, reply_to=None: sent.append((c, t, m)) or 5)
+    monkeypatch.setattr(B, "_edit_chunk", lambda c, m, t, pm=None: edited.append(t) or True)
+    body = "\n".join("k %04d %s" % (i, "z" * 50) for i in range(200))
+    out = "Aciklama\n\n```py\n%s\n```\n\nKapanis" % body
+    n = B._finish_streamed("111", 42, out, "TG-007")
+    assert n >= 2
+    assert len(edited) == 1 and edited[0].startswith("Aciklama")
+    joined = "".join(edited) + "".join(t for _, t, _ in sent)
+    for i in (0, 100, 199):
+        assert "k %04d" % i in joined, "satir %d kayboldu" % i
+    assert "Kapanis" in joined
+
+
+def test_finish_streamed_falls_back_when_edit_fails(monkeypatch):
+    monkeypatch.setattr(B, "MARKDOWN_ON", True)
+    monkeypatch.setattr(B, "_edit_chunk", lambda *a, **k: False)
+    sent = []
+    monkeypatch.setattr(B, "_send_chunk",
+                        lambda c, t, m=None, reply_to=None: sent.append(t) or 5)
+    assert B._finish_streamed("111", 42, "kisa cevap", "TG-001") == 1
+    assert sent and "kisa cevap" in sent[0]
+
+
+def test_streaming_intermediate_edits_stay_plain(monkeypatch):
+    """Streaming sirasinda metin yarim olabilir; ara guncellemeler duz
+    metin kalmali, sadece final mesaj bicimlenir."""
+    store = []
+    monkeypatch.setattr(B, "api", _capture_api(store))
+    B.send_message("111", "```py\nyarim kod")
+    B.send_message_id("111", "```py\nyarim kod")
+    for m, p in store:
+        assert "parse_mode" not in p, "ara guncelleme bicimlenmemeli"
+
+
+def test_edit_not_modified_is_success(monkeypatch):
+    """Telegram ayni icerik icin 400 'message is not modified' doner.
+    Bu basarisiz sayilirsa ayni cevap ikinci kez gonderilir."""
+    calls = []
+
+    def fake_api(method, payload=None, timeout=45, max_retries=None):
+        calls.append(dict(payload))
+        raise _http_error(400, {"ok": False,
+                                "description": "Bad Request: message is not modified: "
+                                               "nothing to change"})
+    monkeypatch.setattr(B, "api", fake_api)
+    assert B._edit_chunk("111", 42, "ayni", None) is True
+    assert len(calls) == 1, "tekrar denenmemeli"
+
+
+def test_edit_not_modified_after_parse_fallback_is_success(monkeypatch):
+    """Bicim reddi -> duz metne dus -> 'not modified' -> yine basarili."""
+    calls = []
+
+    def fake_api(method, payload=None, timeout=45, max_retries=None):
+        calls.append(dict(payload))
+        if payload.get("parse_mode"):
+            raise _http_error(400, {"ok": False,
+                                    "description": "Bad Request: can't parse entities"})
+        raise _http_error(400, {"ok": False,
+                                "description": "Bad Request: message is not modified"})
+    monkeypatch.setattr(B, "api", fake_api)
+    assert B._edit_chunk("111", 42, "Metin \\*k\\*", "MarkdownV2") is True
+    assert len(calls) == 2
+    assert "parse_mode" not in calls[1]
+
+
+def test_edit_parse_error_then_success(monkeypatch):
+    calls = []
+
+    def fake_api(method, payload=None, timeout=45, max_retries=None):
+        calls.append(dict(payload))
+        if payload.get("parse_mode"):
+            raise _http_error(400, {"ok": False,
+                                    "description": "Bad Request: can't parse entities"})
+        return {"ok": True, "result": True}
+    monkeypatch.setattr(B, "api", fake_api)
+    assert B._edit_chunk("111", 42, "Metin \\*k\\*", "MarkdownV2") is True
+    assert "\\*" not in calls[1]["text"]
+
+
+def test_error_body_is_read_once_and_cached(monkeypatch):
+    """HTTPError govdesi yalnizca bir kez okunabilir. Iki karar ayni
+    istisna uzerinde verildiginde ikincisi de dogru sonucu vermeli."""
+    e = _http_error(400, {"ok": False, "description": "Bad Request: can't parse entities"})
+    assert B._is_parse_error(e) is True
+    assert B._is_not_modified(e) is False
+    # ikinci okuma bos donmemeli
+    assert B._is_parse_error(e) is True
+    assert B._read_error_body(e)["description"].startswith("Bad Request")

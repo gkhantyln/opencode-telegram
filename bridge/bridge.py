@@ -67,6 +67,7 @@ if BRIDGE_DIR not in sys.path:
     sys.path.insert(0, BRIDGE_DIR)
 
 import atomic_json as _aj  # noqa: E402  (sys.path ayarindan sonra gelmeli)
+import md2 as _md2  # noqa: E402
 
 
 def load_dotenv(path):
@@ -181,18 +182,35 @@ API_RETRY_AFTER_CAP = 30.0
 
 
 def _read_error_body(e):
-    """HTTPError govdesini JSON olarak oku (retry_after burada gelir)."""
+    """HTTPError govdesini JSON olarak oku (retry_after burada gelir).
+
+    Govde yalnizca BIR kez okunabilir; ayni istisna uzerinde birden fazla
+    karar verilirse (parse hatasi mi, not-modified mi) ilk okuma ikincisini
+    boslardi. Bu yuzden sonuc istisnaya cache'lenir.
+    """
+    cached = getattr(e, "_tg_body", None)
+    if cached is not None:
+        return cached
+    body = {}
     try:
         raw = e.read()
     except Exception:
-        return {}
-    if not raw:
-        return {}
+        raw = b""
+    if raw:
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+            body = d if isinstance(d, dict) else {}
+        except Exception:
+            body = {}
     try:
-        d = json.loads(raw.decode("utf-8", "replace"))
+        e._tg_body = body
     except Exception:
-        return {}
-    return d if isinstance(d, dict) else {}
+        pass
+    return body
+
+
+def _err_desc(e):
+    return str((_read_error_body(e) or {}).get("description") or "").lower()
 
 
 def _retry_wait(code, body, attempt):
@@ -405,6 +423,111 @@ def send_action(chat_id):
         api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
     except Exception:
         pass
+
+
+# ---------- Markdown gonderimi (bicimleme + geri dusus zinciri) ----------
+
+# opencode Markdown dondurur; duz metin gonderilince isaretler ham gorunur.
+# 0 ile tamamen kapatilabilir (bicimleme hatasi sorunu olursa ilk bakacak yer).
+MARKDOWN_ON = env("TELEGRAM_MARKDOWN", "1") not in ("0", "false", "no")
+
+_PARSE_ERR_MARKERS = (
+    "can't parse", "can't find end of the entity", "entity beginning",
+    "entity url", "wrong http url", "url host is empty", "unsupported start tag",
+)
+
+
+def _is_parse_error(exc):
+    """Telegram bicimlemeyi mi reddetti? (400 + parse aciklamasi)"""
+    if getattr(exc, "code", None) != 400:
+        return False
+    desc = _err_desc(exc)
+    return any(m in desc for m in _PARSE_ERR_MARKERS)
+
+
+def _md_pieces(text, limit=3900):
+    """(metin, parse_mode) listesi.
+
+    Markdown kapaliysa duz parcalama. Aciksa blok bazli paketleme: kod
+    blogu asla karakter sayisiyla kesilmez (bkz. md2.pack).
+    """
+    if not text:
+        return []
+    if not MARKDOWN_ON:
+        return [(text[i:i + limit], None) for i in range(0, len(text), limit)]
+    return [(c["text"], c["parse_mode"]) for c in _md2.pack(text, limit=limit)] or [(text, None)]
+
+
+def _with_footer(text, parse_mode, footer):
+    """`[TG-001]` gibi etiketi ekler.
+
+    MarkdownV2'de `[` `]` ayrac oldugu icin koseli parantez de kacislanir.
+    """
+    if not footer:
+        return text
+    return (text + "\n\n" + _md2.render_text("[%s]" % footer)) if parse_mode \
+        else "%s\n\n[%s]" % (text, footer)
+
+
+def _send_chunk(chat_id, text, parse_mode=None, reply_to=None):
+    """Tek mesaj gonderir. Bicim reddedilirse duz metne duser.
+
+    Donu: message_id. Bu, bicimleme hatasinin mesaji KAYBETTIRMESINI saglar:
+    Telegram 400 + parse aciklamasi dondugunde ayni icerik parse_mode'suz
+    tekrar gonderilir.
+    """
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to is not None:
+        payload["reply_to_message_id"] = reply_to
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        res = api("sendMessage", payload)
+    except urllib.error.HTTPError as e:
+        if not parse_mode or not _is_parse_error(e):
+            raise
+        log("markdown parse hatasi -> duz metne dusuluyor")
+        payload.pop("parse_mode")
+        payload["text"] = _md2.unescape(text)
+        res = api("sendMessage", payload)
+    return ((res or {}).get("result") or {}).get("message_id")
+
+
+def _is_not_modified(exc):
+    """Telegram ayni icerikle duzenlemeyi 400 ile reddeder.
+
+    Bu bir hata degil, hedef duruma ulasildi demektir. Yanlisca basarisiz
+    sayilirsa ayni mesaj ikinci kez gonderilir (mukerrer cevap).
+    """
+    if getattr(exc, "code", None) != 400:
+        return False
+    return "message is not modified" in _err_desc(exc)
+
+
+def _edit_chunk(chat_id, message_id, text, parse_mode=None):
+    """`editMessageText` + ayni geri dusus zinciri."""
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        api("editMessageText", payload)
+        return True
+    except urllib.error.HTTPError as e:
+        if _is_not_modified(e):
+            return True
+        if not parse_mode or not _is_parse_error(e):
+            return False
+        payload.pop("parse_mode")
+        payload["text"] = _md2.unescape(text)
+        try:
+            api("editMessageText", payload)
+            return True
+        except urllib.error.HTTPError as e2:
+            return _is_not_modified(e2)
+        except Exception:  # noqa: BLE001
+            return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_allowed(chat_id):
@@ -1282,23 +1405,37 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
 def _finish_streamed(chat_id, msg_id, out, footer):
     """Streaming mesajini tamamla: ilk parcayi duzenle, tasmayi yeni mesajlarda gonder.
 
-    Telegram mesajlari 4000 karakterle sinirli; `editMessageText` de ayni
-    sinirla keser. Bu olmadan serve backend'inde uzun cevabin tamami kaybolurdu
-    (cli backend 11500 karaktere kadar parcalayarak gonderir) - GAP-10.
+    Markdown acikken parcalama blok bazlidir (`md2.pack`): 4000 karakteri asan
+    bir kod blogu karakter sayisiyla kesilmez, satirlara gore bolunur ve her
+    parca gecerli bir ```blog``` olarak kalir. Onceki surumde tasma 3800
+    karakterden sonra duz metin gonderiyordu (GAP-10).
     """
+    pieces = _md_pieces(out)
+    if not pieces:
+        return 0
+    head, pm = pieces[0]
+    head = _with_footer(head, pm, footer)
     if not msg_id:
-        return send_message(chat_id, "%s\n\n[%s]" % (out, footer))
-    head = out[:3800]
-    edit_message(chat_id, msg_id, "%s\n\n[%s]" % (head, footer))
-    rest = out[3800:]
-    n = 1
-    for i in range(0, len(rest), 4000):
+        if _send_chunk(chat_id, head, pm) is None:
+            return 0
+        n = 1
+        rest = pieces[1:]
+    elif _edit_chunk(chat_id, msg_id, head, pm):
+        n = 1
+        rest = pieces[1:]
+    else:
+        # duzenleme tutmadi (eski icerik degismis ya da bicim reddi) -> yeni mesaj
+        if _send_chunk(chat_id, head, pm) is None:
+            return 0
+        n = 1
+        rest = pieces[1:]
+    for text, mode in rest:
         try:
-            send_message(chat_id, rest[i:i + 4000])
-            n += 1
-            time.sleep(0.4)
+            if _send_chunk(chat_id, text, mode) is not None:
+                n += 1
         except Exception:  # noqa: BLE001
             break
+        time.sleep(0.4)
     return n
 
 
@@ -1334,6 +1471,16 @@ def _spawn_worker(chat_id, from_label, prompt, files=None, reply_to=None):
                 "day_in": day_in, "day_out": day_out})
             if streamed:
                 _finish_streamed(str(chat_id), streamed, out, mid)
+            elif MARKDOWN_ON:
+                pieces = _md_pieces(out)
+                first = _with_footer(pieces[0][0], pieces[0][1], mid)
+                n = 1 if _send_chunk(str(chat_id), first, pieces[0][1], reply_to=reply_to) else 0
+                for text, mode in pieces[1:]:
+                    if _send_chunk(str(chat_id), text, mode) is not None:
+                        n += 1
+                    time.sleep(0.4)
+                if not n:
+                    send_message(str(chat_id), "%s\n\n[%s]" % (out, mid), reply_to=reply_to)
             else:
                 send_message(str(chat_id), "%s\n\n[%s]" % (out, mid), reply_to=reply_to)
             s, f = outbox_flush()

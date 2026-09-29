@@ -261,11 +261,28 @@ The ones you are most likely to touch:
 | `TELEGRAM_OPENCODE_AGENT` | `orchestrator` | Which agent answers |
 | `TELEGRAM_OPENCODE_MODEL` | opencode default | Model override |
 | `TELEGRAM_BRIDGE_EXEC` | `1` | `0` = queue only, let the TUI orchestrator work |
+| `TELEGRAM_MARKDOWN` | `1` | Render the reply as MarkdownV2. `0` = always plain text |
+| `TELEGRAM_SET_COMMANDS` | `1` | Register the `/` command menu with BotFather on startup |
+| `TELEGRAM_API_MAX_RETRIES` | `3` | Retries for 429 and transient 5xx. `0` = no retries |
 | `TELEGRAM_DAILY_TOKEN_LIMIT` | `0` (off) | Daily token ceiling |
 | `TELEGRAM_FOLLOW_EDITS` | `0` | Re-run a message when you edit it |
 | `TELEGRAM_PROJECTS` | — | `alias=path,alias2=path2` for multi-project |
 | `TELEGRAM_SCHEDULE` | — | `09:00:/durum;18:00:/gelen` |
 | `TELEGRAM_DIGEST` | `0` | Batch notifications hourly instead of one by one |
+
+### Message formatting
+
+Replies are rendered as Telegram MarkdownV2, so `**bold**`, `_italic_`, `~~strikethrough~~`,
+inline code and fenced code blocks keep their formatting on the phone.
+
+Two details worth knowing:
+
+- **Code blocks are never cut in half.** When an answer is long, the split happens on block
+  and line boundaries, so every message still contains a complete, valid code block. Cutting
+  mid-block would show broken code in Telegram.
+- **Formatting can never lose a message.** If Telegram rejects a message for a formatting
+  reason (HTTP 400 + a parse error), the bridge immediately resends the same content as
+  plain text. Set `TELEGRAM_MARKDOWN=0` to turn formatting off entirely.
 
 ---
 

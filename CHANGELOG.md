@@ -1,5 +1,36 @@
 # Changelog — opencode-telegram
 
+## Unreleased (2.3.0)
+
+Markdown gonderimi. Testler 70 -> 133 (`bridge/md2.py` + 49 yeni test).
+
+### Eklendi
+
+- **Cevaplar MarkdownV2 olarak bicimlenir.** opencode `**kalin**`,
+  `_italik_`, `~~ustu cizili~~`, `` `kod` `` ve ```blok``` uretir; once
+  hepsi duz metin gonderildigi icin Telegram'da isaretler ham gorunuyordu.
+  Yeni `bridge/md2.py`: kod blogu, satir ici kod, baslik, liste, alinti,
+  baglanti. 49 test.
+- **Kod blogu parcalamada bolunmez.** Bloklar atomik paketlenir; limiti
+  asan blog satirlara gore bolunur ve her parca gecerli bir ```blog```
+  olarak kalir. Karakter sayisiyla kesmek Telegram'da bozuk kod gosterir.
+- Bicimleme hatasi **mesaji kaybettirmez**: Telegram 400 + parse hatasi
+  dondugunde ayni icerik `parse_mode`suz tekrar gonderilir.
+- `TELEGRAM_MARKDOWN=0` ile tamamen kapatilabilir.
+
+### Duzeltilen (hata)
+
+- **Ayni icerik iki kez gonderilebiliyordu.** Telegram duzenlemeyi
+  "message is not modified" ile 400 reddediyor; bu bir basarisizlik
+  sanilip ayni cevap yeni mesaj olarak tekrar gonderiliyordu.
+  Artik hedef duruma ulasildi sayiliyor.
+- **HTTPError govdesi iki kez okunamiyordu.** Govde yalnizca bir kez
+  okunabiliyor; "once parse hatasi mi, sonra not-modified mi" diye iki
+  karar verildiginde ikincisi bos donuyordu. Govde istisnaya cache'leniyor.
+- Streaming sirasindaki ara guncellemeler duz metin kalmaya devam ediyor
+  (metin yarim olabilir, MarkdownV2'ye cevirmek bozuk blog uretirdi);
+  yalnizca final mesaj bicimleniyor.
+
 ## Unreleased (2.2.0)
 
 v0.26.1 incelemesi; alinan davranislar stdlib ile yeniden yazildi.
