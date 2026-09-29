@@ -34,11 +34,22 @@ opencode-telegram/
     test_bridge.py    # pytest (TG1-5)
 ```
 
-## Global kurulum hedefi (TG0-3 bitince)
+## Global kurulum
+
+Herhangi bir makinede, bu paket tek basina da durabilir:
 
 ```powershell
-.\scripts\install-global.ps1   # global opencode.json'a telegram MCP'yi ekler
+.\scripts\install-global.ps1   # Windows: global opencode.json'a telegram MCP'yi ekler (backup'li)
+./scripts/install-global.sh    # Linux/macOS
 ```
 
-Sonrasi: herhangi bir projede `telegram_status` calisir, bridge `.env`'deki
-`TELEGRAM_PROJECT_DIR` ile projeye baglanir.
+Sonrasi: bridge `.env`'deki `TELEGRAM_PROJECT_DIR` ile projeye baglanir,
+herhangi bir projede `telegram_status` calisir.
+
+## Backend secimi
+
+- `TELEGRAM_BACKEND=cli` (varsayilan): her soru `opencode run` sureci. Sifir
+  ek servis, yavas soguk baslatma.
+- `TELEGRAM_BACKEND=serve`: `opencode serve` uzerinden sicak oturum, akan
+  cevap (mesaj duzenleme), izin/soru butonlari. Serve ayakta degilse bridge
+  otomatik acar (`TELEGRAM_SERVE_PORT`, sifre uretilir).

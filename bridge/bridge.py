@@ -62,6 +62,9 @@ def _default_project_dir():
 
 DEFAULT_PROJECT_DIR = _default_project_dir()
 
+if BRIDGE_DIR not in sys.path:
+    sys.path.insert(0, BRIDGE_DIR)
+
 
 def load_dotenv(path):
     if not os.path.exists(path):
@@ -93,6 +96,15 @@ PROJECT_DIR = env("TELEGRAM_PROJECT_DIR", DEFAULT_PROJECT_DIR)
 SESSION_PREFIX = env("TELEGRAM_SESSION_PREFIX", "tg")
 OPENCODE_AGENT = env("TELEGRAM_OPENCODE_AGENT", "orchestrator")
 OPENCODE_MODEL = env("TELEGRAM_OPENCODE_MODEL", "")
+SERVE_BACKEND = env("TELEGRAM_BACKEND", "cli").lower() == "serve"
+SERVE_URL = env("TELEGRAM_SERVE_URL", "http://127.0.0.1:4096")
+try:
+    SERVE_PORT = int(env("TELEGRAM_SERVE_PORT", "4096"))
+except ValueError:
+    SERVE_PORT = 4096
+SERVE_PASSWORD = env("TELEGRAM_SERVE_PASSWORD", "")
+_serve_clients = {}
+_serve_proc = None
 BRIDGE_EXEC = env("TELEGRAM_BRIDGE_EXEC", "1") not in ("0", "false", "no")
 try:
     OPENCODE_TIMEOUT = max(30, int(env("TELEGRAM_OPENCODE_TIMEOUT", "600")))
@@ -155,8 +167,110 @@ def api(method, payload=None, timeout=45):
         return json.loads(r.read().decode("utf-8"))
 
 
+# ---------- secret maskeleme (tum giden Telegram metni buradan gecer) ----------
+
+_REDACT_PATTERNS = [
+    r"sk-[A-Za-z0-9\-_]{16,}",
+    r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}",
+    r"github_pat_[A-Za-z0-9_]{16,}",
+    r"AKIA[0-9A-Z]{16}",
+    r"xox[bpas]-[A-Za-z0-9\-]+",
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+]
+
+
+def _redact(text):
+    if not text:
+        return text
+    out = text
+    for pat in _REDACT_PATTERNS:
+        out = re.sub(pat, "[REDACTED]", out)
+    tok = BOT_TOKEN.strip()
+    if tok and len(tok) > 8 and tok in out:
+        out = out.replace(tok, "[REDACTED-BOT-TOKEN]")
+    return out
+
+
+# ---------- audit log (kim, ne istedi, ne oldu) ----------
+
+AUDIT_FILE = os.path.join(MAILBOX_DIR, "telegram_audit.log")
+AUDIT_MAX_BYTES = 200 * 1024
+
+
+def _audit(chat_id, kind, summary, extra=None):
+    try:
+        os.makedirs(MAILBOX_DIR, exist_ok=True)
+        rec = {"ts": _now(), "chat": str(chat_id), "kind": kind,
+               "summary": _redact((summary or "")[:500])}
+        if extra:
+            rec.update(extra)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        if os.path.exists(AUDIT_FILE) and os.path.getsize(AUDIT_FILE) > AUDIT_MAX_BYTES:
+            with open(AUDIT_FILE, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            with open(AUDIT_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[len(lines) // 2:])
+        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def send_message_id(chat_id, text):
+    """Ilk parcayi gonderip Telegram message_id doner (duzenleme/callback icin)."""
+    text = _redact(text)
+    first = (text[:4000] or "")
+    res = api("sendMessage", {"chat_id": chat_id, "text": first})
+    mid = ((res or {}).get("result") or {}).get("message_id")
+    rest = text[4000:]
+    for i in range(0, len(rest), 4000):
+        api("sendMessage", {"chat_id": chat_id, "text": rest[i:i + 4000]})
+        time.sleep(0.4)
+    return mid
+
+
+def edit_message(chat_id, message_id, text):
+    try:
+        api("editMessageText", {"chat_id": chat_id, "message_id": message_id,
+                                "text": _redact(text)[:4000]})
+        return True
+    except Exception:
+        return False
+
+
+def answer_callback(callback_id, text=""):
+    try:
+        api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200]})
+    except Exception:
+        pass
+
+
+def send_buttons(chat_id, text, buttons, reply_to=None):
+    """Inline butonlu mesaj. buttons: [(label, callback_data)]. Donus: message_id."""
+    markup = {"inline_keyboard": [[{"text": label, "callback_data": data}]
+                                  for (label, data) in buttons]}
+    payload = {"chat_id": chat_id, "text": _redact(text)[:4000], "reply_markup": markup}
+    if reply_to is not None:
+        payload["reply_to_message_id"] = reply_to
+    res = api("sendMessage", payload)
+    return ((res or {}).get("result") or {}).get("message_id")
+
+
+pending_perms = {}
+pending_forms = {}
+_perm_seq = [0]
+
+
+def _prune_pending():
+    now = time.time()
+    for store in (pending_perms, pending_forms):
+        for k in [k for k, v in store.items() if now - v.get("ts", 0) > 1800]:
+            store.pop(k, None)
+
+
 def send_message(chat_id, text, reply_to=None):
     """4000'luk parcalarla gonderir. Donus: gonderilen parca sayisi."""
+    text = _redact(text)
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
     n = 0
     for ch in chunks:
@@ -225,6 +339,13 @@ def outbox_flush():
             m["status"] = "FAILED"
             m["error"] = "hedef yok (TELEGRAM_DEFAULT_CHAT_ID bos ya da allowlist bos)"
             failed += 1
+            changed = True
+            continue
+        if DIGEST_ON and to in ("default", ""):
+            _digest_push(m)
+            m["status"] = "SENT"
+            m["error"] = "digest'e alindi"
+            sent += 1
             changed = True
             continue
         ok_all = True
@@ -318,6 +439,7 @@ HELP = (
     "/onay <metin> — orchestrator kuyruguna onay/not birak (HOLD-xxx ile bekleyen isi onayla)\n"
     "/abort — calisan isi durdur\n"
     "/reset — Telegram oturumunu sifirla (yeni oturum acar)\n"
+    "/project — proje listele/sec (cok projeli kullanimda)\n"
     "/model — aktif model | /model list | /model set <provider/model>\n"
     "/yardim — bu liste\n\n"
     "Duz mesaj = /sor. Fotograf/belge gonderebilirsin (incelenir). "
@@ -379,7 +501,7 @@ def _save_session(chat_id, ses_id):
     _save_sess(chat_id, ses=ses_id)
 
 
-def _save_sess(chat_id, ses=None, model=None, clear_ses=False):
+def _save_sess(chat_id, ses=None, model=None, clear_ses=False, project=None):
     try:
         m = _load_sessions()
         ent = _sess_entry(chat_id)
@@ -395,6 +517,11 @@ def _save_sess(chat_id, ses=None, model=None, clear_ses=False):
                 ent["model"] = model
             else:
                 ent.pop("model", None)
+        if project is not None:
+            if project:
+                ent["project"] = project
+            else:
+                ent.pop("project", None)
         if ent:
             m[str(chat_id)] = ent
         else:
@@ -432,13 +559,13 @@ def _opencode_models():
     return _models_cache["list"]
 
 
-def _newest_session(since_ms=0):
+def _newest_session(since_ms=0, cwd=None):
     """Local `session list` (model harcamaz). since_ms sonrasi en yeni oturumu doner."""
     cmd, _ = _opencode_cmd(["session", "list", "--format", "json", "-n", "5"])
     if cmd is None:
         return None
     try:
-        p = subprocess.run(cmd, cwd=PROJECT_DIR, capture_output=True, text=True,
+        p = subprocess.run(cmd, cwd=cwd or PROJECT_DIR, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=60)
         if p.returncode != 0 or not p.stdout.strip():
             return None
@@ -538,6 +665,271 @@ def _wait_proc(proc, abort, chat_id, timeout, reply_to=None):
                     pass
 
 
+# ---------- serve backend (TG2-1; TELEGRAM_BACKEND=serve) ----------
+
+_serve_clients = {}
+
+
+def _serve(directory=None):
+    """ServeClient (dizin bazinda cache); ulasilamiyorsa serve'i ayaga kaldirir."""
+    global _serve_proc
+    import serve_client as _sc
+    directory = directory or PROJECT_DIR
+    if directory in _serve_clients:
+        return _serve_clients[directory]
+    pw = SERVE_PASSWORD or ("tg-local-%d" % (int(time.time()) % 1000000))
+    c = _sc.ServeClient(SERVE_URL, pw, directory)
+    try:
+        c._req("GET", "/api/info", timeout=8)
+        _serve_clients[directory] = c
+        return c
+    except Exception:
+        pass
+    # ayaga kaldir
+    cmd, _ = _opencode_cmd(["serve", "--port", str(SERVE_PORT)])
+    if cmd is None:
+        raise _sc.ServeError("'opencode' bulunamadi, serve acilamiyor.")
+    eenv = dict(os.environ)
+    eenv["OPENCODE_PASSWORD"] = pw
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    _serve_proc = subprocess.Popen(cmd, cwd=PROJECT_DIR, env=eenv,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=flags)
+    c = _sc.ServeClient("http://127.0.0.1:%d" % SERVE_PORT, pw, directory)
+    deadline = time.time() + 30
+    last = None
+    while time.time() < deadline:
+        try:
+            c._req("GET", "/api/info", timeout=5)
+            _serve_clients[directory] = c
+            log("serve ayaga kalkti (port %d)" % SERVE_PORT)
+            return c
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(1)
+    raise _sc.ServeError("serve acilamadi: %s" % (str(last)[-200:] if last else "?"))
+
+
+def _serve_model():
+    m = OPENCODE_MODEL.strip()
+    if m and "/" in m:
+        provider, mid = m.split("/", 1)
+        return (provider, mid)
+    return None
+
+
+def _form_snapshot(form):
+    """Form sozlugunden (key, field, options, title) cikarir; seceneksizse None."""
+    if not isinstance(form, dict):
+        return None
+    title = ""
+    for k in ("title", "question", "message", "label"):
+        if isinstance(form.get(k), str) and form[k].strip():
+            title = form[k].strip()[:200]
+            break
+    found = []
+
+    def _walk(node, key=""):
+        if isinstance(node, dict):
+            opts = node.get("options")
+            if isinstance(opts, list) and opts and all(isinstance(o, (str, dict)) for o in opts):
+                labels = [o if isinstance(o, str) else str(o.get("label", o.get("value", o)))[:60]
+                          for o in opts]
+                found.append((key, labels))
+            for k, v in node.items():
+                if k != "options":
+                    _walk(v, k)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v, key)
+
+    _walk(form.get("fields", form))
+    if not found:
+        return None
+    key, labels = found[0]
+    return (key or "secim", None, labels, title)
+
+
+def run_opencode_serve(prompt, chat_id, from_label, files=None, abort=None, reply_to=None):
+    import serve_client as _sc
+    sid_title = "%s-%s" % (SESSION_PREFIX, str(chat_id).lstrip("-"))
+    wrapped = (
+        "[Telegram] Gonderen: %s (chat %s). "
+        "Cevap Telegram'a gonderilecek: kisa yaz, 3000 karakteri gecme, "
+        "secret/token sizdirma. Soru/gorev:\n\n%s" % (from_label, chat_id, prompt)
+    )
+    try:
+        c = _serve(_chat_dir(chat_id))
+    except Exception as e:  # noqa: BLE001
+        return "HATA: serve baglantisi kurulamadi: %s" % str(e)[-300:], None
+    stored = _sess_entry(chat_id).get("ses")
+    if not stored:
+        try:
+            stored = c.create_session(title="Telegram %s" % sid_title,
+                                      agent=OPENCODE_AGENT, model=_serve_model())
+            _save_sess(chat_id, ses=stored)
+            log("serve session eslestirildi chat=%s -> %s" % (chat_id, stored))
+        except Exception as e:  # noqa: BLE001
+            _debug_log("SERVE-CREATE-FAIL chat=%s err=%s" % (chat_id, str(e)[-500:]))
+            return "HATA: oturum acilamadi: %s" % str(e)[-300:], None
+    fargs = None
+    if files:
+        import mimetypes
+        fargs = []
+        for f in files[:3]:
+            mt, _ = mimetypes.guess_type(f)
+            fargs.append((mt or "application/octet-stream", f))
+    started_ms = int(time.time() * 1000)
+    try:
+        c.prompt(stored, wrapped, files=fargs,
+                 model=_serve_model() if _sess_entry(chat_id).get("model") else None)
+    except Exception as e:  # noqa: BLE001
+        err = str(e)
+        if "ses" in err or "ession" in err or "404" in err:
+            _save_sess(chat_id, clear_ses=True)
+            return run_opencode_serve(prompt, chat_id, from_label, files=files, abort=abort)
+        _debug_log("SERVE-PROMPT-FAIL chat=%s err=%s" % (chat_id, err[-800:]))
+        return "HATA: %s" % err[-400:], None
+    last_ping = [time.time()]
+    stream = {"buf": [], "assistant": None, "failed": False, "stop": False,
+              "msg_id": None, "last_edit": 0.0, "edited": ""}
+    seen_perms = set()
+    seen_forms = set()
+
+    def _sse_loop():
+        import serve_client as _sc2
+        while not stream["stop"]:
+            if abort is not None and abort.is_set():
+                return
+            try:
+                for ev in c.events(stop_flag=lambda: stream["stop"] or (
+                        abort is not None and abort.is_set()), timeout=25):
+                    d = ev.get("data") or {}
+                    if not isinstance(d, dict):
+                        continue
+                    ed = d.get("data") or {}
+                    if not isinstance(ed, dict):
+                        continue
+                    if ed.get("sessionID") != stored:
+                        continue
+                    t = d.get("type", "")
+                    if t == "session.text.delta":
+                        stream["buf"].append(str(ed.get("delta", "")))
+                        if ed.get("assistantMessageID"):
+                            stream["assistant"] = ed["assistantMessageID"]
+                    elif t in ("session.execution.succeeded", "session.execution.failed",
+                               "session.text.ended"):
+                        if t != "session.text.ended" or not stream["buf"]:
+                            stream["failed"] = (t == "session.execution.failed")
+            except Exception:
+                time.sleep(2)
+
+    def _poll_approvals():
+        try:
+            for p in c.list_permissions(stored):
+                rid = p.get("id") if isinstance(p, dict) else None
+                if rid and rid not in seen_perms and rid not in pending_perms:
+                    seen_perms.add(rid)
+                    action = p.get("action", "?") if isinstance(p, dict) else "?"
+                    res = (p.get("resources") or []) if isinstance(p, dict) else []
+                    msg = (p.get("message") or "") if isinstance(p, dict) else ""
+                    txt = "Izin istegi: %s\n%s%s" % (
+                        action, ", ".join(res[:5]),
+                        ("\n%s" % msg[:300]) if msg else "")
+                    mid = send_buttons(str(chat_id), txt, [
+                        ("Onayla (1 kez)", "prm:%s:once" % rid),
+                        ("Her zaman", "prm:%s:always" % rid),
+                        ("Reddet", "prm:%s:reject" % rid)], reply_to=reply_to)
+                    pending_perms[rid] = {"session": stored, "chat": str(chat_id),
+                                          "msg": mid, "ts": time.time()}
+            for f in c.list_forms(stored):
+                fid = f.get("id") if isinstance(f, dict) else None
+                if not fid or fid in seen_forms:
+                    continue
+                seen_forms.add(fid)
+                snap = _form_snapshot(f)
+                if snap is None:
+                    continue
+                _perm_seq[0] += 1
+                short = "F-%03d" % _perm_seq[0]
+                pending_forms[short] = {"session": stored, "chat": str(chat_id),
+                                        "formID": fid, "key": snap[0],
+                                        "options": snap[2], "ts": time.time(), "msg": None}
+                mid = send_buttons(str(chat_id),
+                                   "Secim gerekli%s:\n%s" % (
+                                       (" (%s)" % snap[3]) if snap[3] else "",
+                                       "\n".join("%d. %s" % (i + 1, o)
+                                                 for i, o in enumerate(snap[2][:8]))),
+                                   [("Seç: %s" % o[:20], "frm:%s:%d" % (short, i))
+                                    for i, o in enumerate(snap[2][:8])],
+                                   reply_to=reply_to)
+                pending_forms[short]["msg"] = mid
+            _prune_pending()
+        except Exception as e:  # noqa: BLE001
+            log("approval poll: %s" % str(e)[-150:])
+
+    def _tick():
+        if abort is not None and abort.is_set():
+            return
+        _poll_approvals()
+        now = time.time()
+        if now - last_ping[0] >= 180:
+            last_ping[0] = now
+            try:
+                mins = int((now - started_ms / 1000) // 60)
+                send_message(str(chat_id),
+                             "Hala calisiyorum (%d dk gecti)... /abort ile durdurabilirsin." % mins)
+            except Exception:
+                pass
+        else:
+            try:
+                send_action(str(chat_id))
+            except Exception:
+                pass
+
+    # streaming: placeholder + SSE toplayici
+    try:
+        stream["msg_id"] = send_message_id(str(chat_id), "...")
+    except Exception:
+        stream["msg_id"] = None
+    sse_th = threading.Thread(target=_sse_loop, daemon=True)
+    sse_th.start()
+    last_flush = [0.0]
+
+    def _tick_stream():
+        _tick()
+        if stream["msg_id"] and time.time() - last_flush[0] >= 2 and stream["buf"]:
+            last_flush[0] = time.time()
+            cur = "".join(stream["buf"])[:3900]
+            if cur != stream["edited"]:
+                stream["edited"] = cur
+                edit_message(str(chat_id), stream["msg_id"], cur + " ...")
+
+    try:
+        out = c.wait_reply(stored, started_ms, timeout=OPENCODE_TIMEOUT,
+                           stop_flag=(lambda: abort is not None and abort.is_set()),
+                           on_tick=_tick_stream)
+    except Exception as e:  # noqa: BLE001
+        stream["stop"] = True
+        _debug_log("SERVE-WAIT-FAIL chat=%s err=%s" % (chat_id, str(e)[-500:]))
+        return "HATA: %s" % str(e)[-400:], None
+    stream["stop"] = True
+    if out is None:
+        try:
+            c.interrupt(stored)
+        except Exception:
+            pass
+        if stream["msg_id"]:
+            edit_message(str(chat_id), stream["msg_id"], "Durduruldu (/abort).")
+        return "Durduruldu (/abort).", stream["msg_id"]
+    final = out.strip() or "(bos cikti)"
+    if stream["msg_id"]:
+        edit_message(str(chat_id), stream["msg_id"], final)
+    return final, stream["msg_id"]
+
+
 def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=None):
     sid = "%s-%s" % (SESSION_PREFIX, str(chat_id).lstrip("-"))
     wrapped = (
@@ -546,6 +938,7 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
         "secret/token sizdirma. Soru/gorev:\n\n%s" % (from_label, chat_id, prompt)
     )
     stored = _sess_entry(chat_id).get("ses")
+    cdir = _chat_dir(chat_id)
     model = _chat_model(chat_id)
     model_args = ["--model", model] if model else []
     file_args = []
@@ -561,7 +954,7 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
         if cmd is None:
             return None
         try:
-            proc = subprocess.Popen(cmd, cwd=PROJECT_DIR, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, cwd=cdir, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True,
                                     encoding="utf-8", errors="replace")
         except Exception as e:  # noqa: BLE001
@@ -609,7 +1002,7 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
         if p == "TIMEOUT":
             return "HATA: opencode %d sn'de bitmedi. /durum ile kontrol edin." % OPENCODE_TIMEOUT
     if not stored and p.returncode == 0:
-        fresh = _newest_session(started_ms)
+        fresh = _newest_session(started_ms, cdir)
         if fresh:
             _save_sess(chat_id, ses=fresh)
             log("yeni session eslestirildi chat=%s -> %s" % (chat_id, fresh))
@@ -626,15 +1019,35 @@ def _spawn_worker(chat_id, from_label, prompt, files=None, reply_to=None):
     box = {"reply_to": reply_to}
 
     def _run():
+        t0 = time.time()
         try:
-            out = trim_output(run_opencode(prompt, chat_id, from_label,
-                                           files=files, abort=abort, proc_box=box))
+            streamed = None
+            if SERVE_BACKEND:
+                out, streamed = run_opencode_serve(prompt, chat_id, from_label,
+                                                   files=files, abort=abort,
+                                                   reply_to=reply_to)
+                out = trim_output(out)
+            else:
+                out = trim_output(run_opencode(prompt, chat_id, from_label,
+                                               files=files, abort=abort, proc_box=box))
             shown = prompt if len(prompt) < 4000 else prompt[:4000]
             if files:
                 shown = "[dosya: %s] %s" % (", ".join(os.path.basename(f) for f in files), shown)
             mid = inbox_add(chat_id, from_label, shown,
                             handled_by="bridge", response_preview=out)
-            send_message(str(chat_id), "%s\n\n[%s]" % (out, mid), reply_to=reply_to)
+            day_in, day_out = _budget_add((_sess_entry(chat_id).get("ses") or ""),
+                                            _chat_dir(chat_id))
+            _audit(chat_id, "run", shown, {
+                "from": from_label, "model": _chat_model(chat_id) or "default",
+                "session": (_sess_entry(chat_id).get("ses") or "")[:20],
+                "secs": round(time.time() - t0, 1),
+                "out_len": len(out), "files": len(files or []),
+                "aborted": out.startswith("Durduruldu"),
+                "day_in": day_in, "day_out": day_out})
+            if streamed:
+                edit_message(str(chat_id), streamed, "%s\n\n[%s]" % (out[:3800], mid))
+            else:
+                send_message(str(chat_id), "%s\n\n[%s]" % (out, mid), reply_to=reply_to)
             s, f = outbox_flush()
             if s or f:
                 log("outbox flush: sent=%d failed=%d" % (s, f))
@@ -669,13 +1082,13 @@ def trim_output(out, limit=11500):
 
 # ---------- mesaj isleme ----------
 
-def _session_stats(ses_id):
+def _session_stats(ses_id, cwd=None):
     """session export'tan: mesaj sayisi + son asistan tokenleri (ucretsiz, local)."""
     cmd, _ = _opencode_cmd(["session", "export", ses_id])
     if cmd is None:
         return ""
     try:
-        p = subprocess.run(cmd, cwd=PROJECT_DIR, capture_output=True, text=True,
+        p = subprocess.run(cmd, cwd=cwd or PROJECT_DIR, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=30)
         if p.returncode != 0 or not (p.stdout or "").strip():
             return ""
@@ -684,6 +1097,24 @@ def _session_stats(ses_id):
         last = None
         for m in reversed(ms):
             if isinstance(m, dict) and m.get("type") == "assistant" and m.get("tokens"):
+                last = m["tokens"]
+                break
+        if not last:
+            return "Mesaj: %d (token bilgisi yok)" % len(ms)
+        return ("Mesaj: %d | Son asistan: in=%s out=%s reasoning=%s" % (
+            len(ms), last.get("input"), last.get("output"), last.get("reasoning")))
+    except Exception:
+        return ""
+
+
+def _session_stats_serve(ses_id, directory=None):
+    try:
+        c = _serve(directory)
+        ms = c.messages(ses_id) or []
+        last = None
+        for m in reversed(ms):
+            if isinstance(m, dict) and m.get("type") == "assistant" \
+                    and isinstance(m.get("tokens"), dict):
                 last = m["tokens"]
                 break
         if not last:
@@ -703,7 +1134,10 @@ def cmd_status_for_chat(chat_id=None):
     if not ses:
         return base + "\n\nTelegram oturumu: yok (ilk soruda acilir)"
     model = ent.get("model") or OPENCODE_MODEL or "(opencode varsayilani)"
-    stats = _session_stats(ses)
+    if SERVE_BACKEND:
+        stats = _session_stats_serve(ses, _chat_dir(chat_id))
+    else:
+        stats = _session_stats(ses, _chat_dir(chat_id))
     extra = "\n\nTelegram oturumu: %s...\nModel: %s" % (ses[:16], model)
     if stats:
         extra += "\n%s" % stats
@@ -747,13 +1181,19 @@ def cmd_reset(chat_id):
     ent = _sess_entry(chat_id)
     ses = ent.get("ses")
     if ses:
-        cmd, _ = _opencode_cmd(["session", "delete", ses])
-        if cmd is not None:
+        if SERVE_BACKEND:
             try:
-                subprocess.run(cmd, cwd=PROJECT_DIR, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=30)
+                _serve(_chat_dir(chat_id)).delete_session(ses)
             except Exception:
                 pass
+        else:
+            cmd, _ = _opencode_cmd(["session", "delete", ses])
+            if cmd is not None:
+                try:
+                    subprocess.run(cmd, cwd=_chat_dir(chat_id), capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=30)
+                except Exception:
+                    pass
     _save_sess(chat_id, clear_ses=True)
     if ses:
         return "Oturum sifirlandi (eski oturum silindi). Sonraki soru yeni oturum acar."
@@ -827,6 +1267,55 @@ def _hold_take(chat_id, hid):
     return None
 
 
+# ---------- multi-project (TG3-3): TELEGRAM_PROJECTS="alias=yol,..." ----------
+
+def _projects():
+    out = {}
+    for chunk in env("TELEGRAM_PROJECTS", "").split(","):
+        chunk = chunk.strip()
+        if "=" in chunk:
+            alias, _, path = chunk.partition("=")
+            alias, path = alias.strip(), path.strip().strip('"')
+            if alias and path and os.path.isdir(path):
+                out[alias] = os.path.normpath(path)
+    return out
+
+
+def _chat_dir(chat_id):
+    projs = _projects()
+    alias = _sess_entry(chat_id).get("project")
+    if alias and alias in projs:
+        return projs[alias]
+    return PROJECT_DIR
+
+
+def cmd_project(text, chat_id):
+    parts = text.strip().split()
+    projs = _projects()
+    if not projs:
+        return "Proje listesi bos (TELEGRAM_PROJECTS tanimli degil). Tek proje modundasiniz."
+    cur = _sess_entry(chat_id).get("project")
+    if len(parts) == 1 or parts[1].lower() in ("list", "liste"):
+        lines = ["Projeler (aktif *):"]
+        for alias, path in sorted(projs.items()):
+            lines.append("%s %s: %s" % ("*" if alias == cur else " ", alias, path))
+        if not cur:
+            lines.append("(varsayilan proje: %s)" % PROJECT_DIR)
+        return "\n".join(lines)
+    if parts[1].lower() == "current":
+        return "Aktif proje: %s" % (cur or "(varsayilan) %s" % PROJECT_DIR)
+    if parts[1].lower() == "set" and len(parts) >= 3:
+        alias = parts[2]
+        if alias not in projs:
+            return "Bilinmeyen proje. /project list ile bak."
+        if _is_busy(chat_id):
+            return "Once /abort ile calisan isi durdur."
+        _save_sess(chat_id, clear_ses=True)
+        _save_sess(chat_id, project=alias)
+        return "Proje ayarlandi: %s (%s). Sonraki soru burada yeni oturum acar." % (alias, projs[alias])
+    return "Kullanim: /project list | /project current | /project set <alias>"
+
+
 def handle_text(chat_id, from_label, text, reply_to=None):
     t = text.strip()
     low = t.lower()
@@ -844,6 +1333,8 @@ def handle_text(chat_id, from_label, text, reply_to=None):
         return cmd_reset(chat_id), False
     if low == "/model" or low.startswith("/model ") or low.startswith("/model@"):
         return cmd_model(t, chat_id), False
+    if low == "/project" or low.startswith("/project ") or low.startswith("/project@"):
+        return cmd_project(t, chat_id), False
     if low.startswith("/onay"):
         note = t[5:].strip() or "(bos onay)"
         first = note.split()[0].upper() if note.split() else ""
@@ -888,6 +1379,88 @@ def handle_text(chat_id, from_label, text, reply_to=None):
                 "Devam icin: /onay %s (30 dk gecerli)\nVazgecmek icin: gormezden gel." % (
                     danger, t[:200], hid), False)
     return _gate_or_spawn(chat_id, from_label, t, reply_to=reply_to)
+
+
+# ---------- zamanlayici (TG3-2): "HH:MM:/komut;..." -> DEFAULT_CHAT ----------
+
+def _parse_schedule():
+    out = []
+    for chunk in env("TELEGRAM_SCHEDULE", "").split(";"):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        hm, _, cmd = chunk.partition(":/")
+        hm = hm.strip()
+        if len(hm) == 5 and hm[2] == ":" and cmd.strip():
+            out.append((hm, "/" + cmd.strip()))
+    return out
+
+
+_schedule_entries = None
+_schedule_fired = {}
+
+
+def _run_schedule():
+    global _schedule_entries
+    if _schedule_entries is None:
+        _schedule_entries = _parse_schedule()
+    if not _schedule_entries or not DEFAULT_CHAT or DEFAULT_CHAT not in ALLOWED:
+        return
+    now = datetime.now(timezone.utc).astimezone()
+    day, hm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
+    for when, cmd in _schedule_entries:
+        key = (day, when, cmd)
+        if hm >= when and key not in _schedule_fired:
+            _schedule_fired[key] = True
+            try:
+                reply, _ = handle_text(DEFAULT_CHAT, "scheduler", cmd)
+                send_message(DEFAULT_CHAT, "[Zamanlayici %s]\n%s" % (cmd, reply))
+                log("schedule fired %s %s" % (when, cmd))
+            except Exception as e:  # noqa: BLE001
+                log("schedule err: %s" % str(e)[-150:])
+
+
+# ---------- digest modu (TG3-4): bildirimleri saatlik topla ----------
+
+DIGEST_ON = env("TELEGRAM_DIGEST", "0") not in ("0", "", "false", "no")
+DIGEST_FILE = os.path.join(MAILBOX_DIR, "telegram_digest.json")
+DIGEST_SECS = 3600
+
+
+def _digest_push(m):
+    st = _load(DIGEST_FILE, {"items": [], "window_start": time.time()})
+    st["items"].append({"ts": _now(), "to": m.get("to"), "text": m.get("text", "")})
+    st["items"] = st["items"][-50:]
+    _save(DIGEST_FILE, st)
+
+
+def _digest_due():
+    st = _load(DIGEST_FILE, {"items": [], "window_start": time.time()})
+    items = st.get("items", [])
+    if not items:
+        return False
+    return (time.time() - st.get("window_start", 0)) >= DIGEST_SECS
+
+
+def _digest_flush():
+    st = _load(DIGEST_FILE, {"items": [], "window_start": time.time()})
+    items = st.get("items", [])
+    if not items:
+        return 0
+    body = "Saatlik ozet (%d bildirim):\n\n%s" % (
+        len(items), "\n---\n".join(i.get("text", "")[:800] for i in items))
+    dests = sorted({(i.get("to") or "default") for i in items})
+    sent = 0
+    for d in dests:
+        to = DEFAULT_CHAT if d in ("default", "") else d
+        if to and to in ALLOWED:
+            try:
+                send_message(to, body)
+                sent += 1
+            except Exception:
+                pass
+    _save(DIGEST_FILE, {"items": [], "window_start": time.time()})
+    return sent
 
 
 # ---------- fotograf / belge destegi (opencode --file) ----------
@@ -937,11 +1510,88 @@ def _queue_media(chat_id, label, group, local, caption):
         g["caption"] = caption
 
 
+# ---------- butce freni (gunluk token sayaci) ----------
+
+BUDGET_FILE = os.path.join(MAILBOX_DIR, "telegram_budget.json")
+try:
+    DAILY_TOKEN_LIMIT = int(env("TELEGRAM_DAILY_TOKEN_LIMIT", "0"))
+except ValueError:
+    DAILY_TOKEN_LIMIT = 0
+
+
+def _today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _budget_add(ses_id, cwd=None):
+    """Oturumdaki yeni asistan mesajlarinin tokenlerini bugune ekler. Donus: (gunluk_in, gunluk_out)."""
+    if not ses_id:
+        st = _load(BUDGET_FILE, {})
+        day = st.get(_today(), {"in": 0, "out": 0})
+        return day.get("in", 0), day.get("out", 0)
+    cmd, _ = _opencode_cmd(["session", "export", ses_id])
+    new_in, new_out, last_id = 0, 0, None
+    try:
+        if cmd is not None:
+            p = subprocess.run(cmd, cwd=cwd or PROJECT_DIR, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30)
+            if p.returncode == 0 and (p.stdout or "").strip():
+                ms = json.loads(p.stdout).get("messages", [])
+                st = _load(BUDGET_FILE, {})
+                seen = (st.get("sessions", {}).get(ses_id) or "")
+                started = not seen
+                for m in ms:
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("id") == seen:
+                        started = True
+                        continue
+                    if not started:
+                        continue
+                    last_id = m.get("id") or last_id
+                    if m.get("type") == "assistant" and isinstance(m.get("tokens"), dict):
+                        new_in += int(m["tokens"].get("input", 0) or 0)
+                        new_out += int(m["tokens"].get("output", 0) or 0)
+                if last_id:
+                    st.setdefault("sessions", {})[ses_id] = last_id
+                day = st.setdefault(_today(), {"in": 0, "out": 0})
+                day["in"] = day.get("in", 0) + new_in
+                day["out"] = day.get("out", 0) + new_out
+                # eski gunleri buda
+                for k in [k for k in st if k not in ("sessions", _today())][:30]:
+                    if len(k) == 10:
+                        st.pop(k, None)
+                _save(BUDGET_FILE, st)
+                return day["in"], day["out"]
+    except Exception:
+        pass
+    st = _load(BUDGET_FILE, {})
+    day = st.get(_today(), {"in": 0, "out": 0})
+    return day.get("in", 0), day.get("out", 0)
+
+
+def _budget_exceeded():
+    if not DAILY_TOKEN_LIMIT or DAILY_TOKEN_LIMIT <= 0:
+        return None
+    st = _load(BUDGET_FILE, {})
+    day = st.get(_today(), {"in": 0, "out": 0})
+    total = day.get("in", 0) + day.get("out", 0)
+    if total >= DAILY_TOKEN_LIMIT:
+        return total
+    return None
+
+
 def _gate_or_spawn(chat_id, label, prompt, files=None, reply_to=None):
     """Yikici icerikse HOLD'a al, yoksa worker baslat. Donus: (reply, executed)."""
+    used = _budget_exceeded()
+    if used is not None:
+        return ("Gunluk token limiti asildi (%d/%d). Yarin devam ederiz "
+                "(TELEGRAM_DAILY_TOKEN_LIMIT)." % (used, DAILY_TOKEN_LIMIT), False)
     danger = _check_dangerous(prompt)
     if danger:
         hid = _hold_create(chat_id, label, prompt, files)
+        _audit(chat_id, "hold", prompt, {"from": label, "pattern": danger, "hold": hid,
+                                         "files": len(files or [])})
         return ("Duraklatildi: '%s' yakalandi.\n\nOngosterim: %s\n\n"
                 "Devam icin: /onay %s (30 dk gecerli)\nVazgecmek icin: gormezden gel." % (
                     danger, prompt[:200], hid), False)
@@ -985,7 +1635,71 @@ def _flush_media(force=False):
             pass
 
 
+def handle_callback(cb):
+    data = cb.get("data", "") or ""
+    cb_id = cb.get("id", "")
+    frm = cb.get("from", {}) or {}
+    uid = frm.get("id")
+    label = ("@" + frm.get("username")) if frm.get("username") else str(uid or "?")
+    if uid is None or not is_allowed(uid):
+        answer_callback(cb_id)
+        log("DENIED-cb user=%s data=%.40s" % (label, data))
+        return
+    _prune_pending()
+    if data.startswith("prm:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            answer_callback(cb_id, "Hatali buton.")
+            return
+        _, rid, decision = parts
+        info = pending_perms.pop(rid, None)
+        if info is None or decision not in ("once", "always", "reject"):
+            answer_callback(cb_id, "Istek suresi dolmus.")
+            return
+        try:
+            _serve().reply_permission(info["session"], rid, decision)
+            answer_callback(cb_id, "Kaydedildi.")
+            edit_message(info["chat"], info.get("msg"),
+                         "Izin istegi sonuclandi: %s (%s)" % (
+                             {"once": "1 kez onay", "always": "her zaman",
+                              "reject": "reddedildi"}[decision], rid))
+        except Exception as e:  # noqa: BLE001
+            answer_callback(cb_id, "Hata: %s" % str(e)[-100:])
+        return
+    if data.startswith("frm:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            answer_callback(cb_id, "Hatali buton.")
+            return
+        _, short, idx = parts
+        info = pending_forms.pop(short, None)
+        if info is None:
+            answer_callback(cb_id, "Secim suresi dolmus.")
+            return
+        try:
+            i = int(idx)
+            value = info["options"][i]
+        except (ValueError, IndexError):
+            answer_callback(cb_id, "Hatali secim.")
+            return
+        try:
+            _serve().reply_form(info["session"], info["formID"], {info["key"]: value})
+            answer_callback(cb_id, "Gonderildi.")
+            edit_message(info["chat"], info.get("msg"),
+                         "Secimin iletildi: %s" % value[:200])
+        except Exception as e:  # noqa: BLE001
+            answer_callback(cb_id, "Hata: %s" % str(e)[-100:])
+        return
+    answer_callback(cb_id)
+
+
 def handle_update(u):
+    if "callback_query" in u:
+        try:
+            handle_callback(u["callback_query"])
+        except Exception as e:  # noqa: BLE001
+            log("ERROR callback: %s" % str(e)[-200:])
+        return
     msg = u.get("message") or u.get("edited_message") or {}
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
@@ -1000,6 +1714,37 @@ def handle_update(u):
         return
     photo = msg.get("photo")
     doc = msg.get("document")
+    voice = msg.get("voice") or msg.get("audio")
+    if voice:
+        try:
+            if int(voice.get("file_size", 0)) > MAX_UPLOAD_BYTES:
+                send_message(str(chat_id), "Ses dosyasi 20MB sinirini asiyor.", reply_to=msg_id)
+                return
+            if int(voice.get("duration", 0)) > 600:
+                send_message(str(chat_id), "Ses 10 dakikadan uzun olmamali.", reply_to=msg_id)
+                return
+            local = _download_tg_file(voice.get("file_id"), "ses.ogg")
+            log("VOICE chat=%s user=%s file=%s" % (chat_id, label, os.path.basename(local)))
+            if _is_busy(str(chat_id)):
+                send_message(str(chat_id), "Halen bir is calisiyor. Bitmesini bekle ya da /abort ile durdur.",
+                             reply_to=msg_id)
+            elif not BRIDGE_EXEC:
+                mid = inbox_add(str(chat_id), label, "[SES] " + os.path.basename(local))
+                send_message(str(chat_id), "Ses kuyruga alindi (%s)." % mid, reply_to=msg_id)
+            else:
+                reply, _ = _gate_or_spawn(
+                    str(chat_id), label,
+                    "Ekteki ses kaydini once kelimesi kelimesine yaziya dok, sonra icindeki "
+                    "istegi yerine getir. (Modelin ses destegi yoksa bunu belirt.)",
+                    files=[local], reply_to=msg_id)
+                send_message(str(chat_id), reply, reply_to=msg_id)
+        except Exception as e:  # noqa: BLE001
+            log("ERROR voice: %s" % str(e)[-200:])
+            try:
+                send_message(str(chat_id), "Ses alinamadi: %s" % str(e)[-300:])
+            except Exception:
+                pass
+        return
     if photo or doc:
         caption = (msg.get("caption", "") or "").strip()
         try:
@@ -1129,8 +1874,14 @@ def main_loop():
     while True:
         try:
             _flush_media()
+            _run_schedule()
+            if DIGEST_ON and _digest_due():
+                n = _digest_flush()
+                if n:
+                    log("digest flush: %d chat" % n)
             res = api("getUpdates", {"timeout": POLL_TIMEOUT, "offset": offset,
-                                     "allowed_updates": ["message", "edited_message"]},
+                                     "allowed_updates": ["message", "edited_message",
+                                                         "callback_query"]},
                       timeout=POLL_TIMEOUT + 15)
             if not res.get("ok"):
                 log("getUpdates ok=false: %.200s" % json.dumps(res))
@@ -1178,6 +1929,7 @@ def selftest():
     print("DEFAULT_CHAT:", DEFAULT_CHAT or "(bos)")
     print("EXEC        :", BRIDGE_EXEC, "| agent:", OPENCODE_AGENT,
           "| model:", OPENCODE_MODEL or "(opencode varsayilani)", "| timeout:", OPENCODE_TIMEOUT)
+    print("BACKEND     :", "serve (%s)" % SERVE_URL if SERVE_BACKEND else "cli (opencode run)")
     try:
         cmd, _ = _opencode_cmd(["--version"])
         if cmd is None:
@@ -1199,10 +1951,28 @@ def selftest():
     return 0 if ok else 1
 
 
+def _notify_death(err):
+    try:
+        if DEFAULT_CHAT and DEFAULT_CHAT in ALLOWED:
+            api("sendMessage", {"chat_id": DEFAULT_CHAT,
+                                "text": "Kopru beklenmedik sekilde durdu: %s. Yeniden baslatin." % str(err)[-200:]},
+                timeout=15)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
         sys.exit(0)
-    main_loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        pass
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _notify_death(e)
+        raise
