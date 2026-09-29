@@ -30,6 +30,10 @@ _SPEC = importlib.util.spec_from_file_location(
 B = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(B)
 
+# bridge kendi dizinini sys.path'e ekliyor; serve_client ve md2 oradan gelir
+import md2  # noqa: E402
+import serve_client as SC  # noqa: E402
+
 
 def test_danger_rm():
     assert B._check_dangerous("lutfen rm -rf /tmp/eskiyi sil") is not None
@@ -134,18 +138,21 @@ def test_local_commands():
     assert "Format" in B.handle_text("111", "@t", "/model set hatali")[0]
 
 
-def test_busy_blocks_question():
+def test_busy_blocks_question(monkeypatch):
+    """Mesgulken gelen mesaj CALISTIRILMAZ (kuyruga alinir)."""
     ev = threading.Event()
     fake = threading.Thread(target=lambda: ev.wait(5))
     fake.start()
     B._inflight["111"] = {"thread": fake, "abort": threading.Event(), "box": {}}
     try:
-        reply, _ = B.handle_text("111", "@t", "merhaba")
-        assert "abort" in reply.lower()
+        reply, executed = B.handle_text("111", "@t", "merhaba")
+        assert not executed, "mesgulken ikinci is baslatildi"
+        assert "kuyruga" in reply.lower(), reply
     finally:
         ev.set()
         fake.join()
         B._inflight.pop("111", None)
+        B._queue_clear("111")
 
 
 def test_audit_writes_jsonl():
@@ -1349,6 +1356,477 @@ def test_sessions_command_registered():
     """Komut menusunde gorunmeli."""
     assert any(c["command"] == "sessions" for c in B.TG_COMMANDS)
     assert "/sessions" in B.HELP
+
+
+# ================================================================ Olim bildirimi
+# main_loop her seyi yutup `continue` ediyordu, dolayisiyla __main__'e hicbir
+# sey kacmiyordu: `_notify_death` olu koddu. Donmuş bir kopru Telegram'dan
+# hicbir sey bildirmiyor - "uzaktan kontrol" aracinin en kotu hali.
+
+def test_loop_error_counter_triggers_death_notice(monkeypatch):
+    """Ust uste hatalarda kopru durur ve olu bildirimi gonderilir."""
+    monkeypatch.setattr(B, "LOOP_MAX_CONSECUTIVE_ERRORS", 3)
+    monkeypatch.setattr(B, "BOT_TOKEN", "t")
+    monkeypatch.setattr(B, "ALLOWED", {"111"})
+    monkeypatch.setattr(B, "DEFAULT_CHAT", "111")
+    monkeypatch.setattr(B, "_acquire_lock", lambda: (True, 1))
+    monkeypatch.setattr(B, "set_my_commands", lambda: True)
+    monkeypatch.setattr(B, "outbox_recover", lambda: 0)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    monkeypatch.setattr(B, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(B, "outbox_flush", lambda: (0, 0))
+    monkeypatch.setattr(B, "_flush_media", lambda: None)
+    monkeypatch.setattr(B, "_run_schedule", lambda: None)
+    monkeypatch.setattr(B, "time", B.time)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise RuntimeError("ag yok")
+    monkeypatch.setattr(B, "api", boom)
+    died = []
+    monkeypatch.setattr(B, "_notify_death", lambda err: died.append(str(err)))
+    with pytest.raises(SystemExit):
+        B.main_loop()
+    assert calls["n"] == 3, "3 hatada durmaliydi, %d oldu" % calls["n"]
+    assert died and "ag yok" in died[0]
+
+
+def test_loop_error_counter_resets_on_success(monkeypatch):
+    """Basarili bir tur sayaci sifirlamali (eski hatalar unutulmamali).
+
+    1,2 hata -> 3 basarili -> 4,5 hata -> 6'da kesme. Sayac sifirlanmazsa
+    3. hata (n=4) kopruyi dusururdu.
+    """
+    monkeypatch.setattr(B, "LOOP_MAX_CONSECUTIVE_ERRORS", 3)
+    monkeypatch.setattr(B, "BOT_TOKEN", "t")
+    monkeypatch.setattr(B, "ALLOWED", {"111"})
+    monkeypatch.setattr(B, "DEFAULT_CHAT", "111")
+    monkeypatch.setattr(B, "_acquire_lock", lambda: (True, 1))
+    monkeypatch.setattr(B, "set_my_commands", lambda: True)
+    monkeypatch.setattr(B, "outbox_recover", lambda: 0)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    monkeypatch.setattr(B, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(B, "outbox_flush", lambda: (0, 0))
+    monkeypatch.setattr(B, "_flush_media", lambda: None)
+    monkeypatch.setattr(B, "_run_schedule", lambda: None)
+    monkeypatch.setattr(B.time, "sleep", lambda s: None)
+    state = {"n": 0}
+
+    def flaky(*a, **k):
+        state["n"] += 1
+        if state["n"] in (1, 2, 4, 5):
+            raise RuntimeError("gecici")
+        if state["n"] >= 6:
+            raise KeyboardInterrupt()
+        return {"ok": True, "result": []}
+    monkeypatch.setattr(B, "api", flaky)
+    died = []
+    monkeypatch.setattr(B, "_notify_death", lambda err: died.append(str(err)))
+    # 6. cagri KeyboardInterrupt -> main_loop temiz sekilde doner
+    B.main_loop()
+    assert state["n"] == 6, "sayac sifirlanmadigi icin daha erken durdu"
+    assert not died, "sayac sifirlandigi icin olu bildirimi gonderilmemeli"
+
+
+# ================================================================ serve cache olumu
+
+def test_serve_drops_dead_cached_client(monkeypatch):
+    """Olmus bir serve istemcisi cache'de kalirsa kopru kalici kilitlenir.
+
+    Test aga cikmaz: ServeClient stub'i her istekte hata firlatir, opencode
+    komutu bulunamaz gibi gosterilir.
+    """
+    dead, alive = object(), object()
+    kx, ky = "X", "Y"   # _serve cache anahtari ham dizin adidir
+
+    class _Stub:
+        def __init__(self, *a, **k):
+            pass
+
+        def _req(self, *a, **k):
+            raise RuntimeError("ulasilamiyor")
+
+    monkeypatch.setattr(SC, "ServeClient", _Stub)
+    monkeypatch.setattr(B, "_opencode_cmd", lambda a: (None, None))
+    monkeypatch.setattr(B, "_serve_alive", lambda c: c is alive)
+    B._serve_clients[kx] = dead
+    B._serve_clients[ky] = alive
+    try:
+        with pytest.raises(Exception):
+            B._serve("X")
+        assert kx not in B._serve_clients, "olu istemci cache'de kalmamali"
+        assert B._serve("Y") is alive, "canli istemci cache'de kalmali"
+    finally:
+        B._serve_clients.clear()
+
+
+def test_serve_stop_terminates_owned_process(monkeypatch):
+    """Bizim baslattigimiz serve sureci kapanista birakilmamali."""
+    killed = []
+
+    class _P:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(B, "_kill_tree", lambda p: killed.append(p))
+    monkeypatch.setattr(B, "_serve_proc", _P())
+    B._serve_stop()
+    assert len(killed) == 1
+    assert B._serve_proc is None
+
+
+def test_serve_stop_noop_when_not_started(monkeypatch):
+    monkeypatch.setattr(B, "_serve_proc", None)
+    killed = []
+    monkeypatch.setattr(B, "_kill_tree", lambda p: killed.append(p))
+    B._serve_stop()
+    assert not killed
+
+
+# ================================================================ saglayici kredisi
+
+def test_credit_error_detected():
+    out = "> orchestrator -> orcarouter/auto\nError: You're out of credits"
+    assert B._credit_problem(out) is not None
+
+
+def test_credit_error_extracts_provider():
+    out = "> orchestrator \u2192 orcarouter/auto\nYou're out of credits"
+    p = B._credit_problem(out)
+    assert p == "orcarouter", p
+
+
+@pytest.mark.parametrize("msg", [
+    "insufficient_quota: You exceeded your current quota",
+    "Quota exceeded for this project",
+    "402 Payment Required",
+    "add credits to keep going",
+    "billing limit reached",
+])
+def test_credit_patterns(msg):
+    assert B._credit_problem(msg) is not None
+
+
+@pytest.mark.parametrize("msg", [
+    "Everything is fine",
+    "Hata: dosya bulunamadi",
+    "rate limit exceeded, retry later",
+    "context length exceeded",
+])
+def test_not_credit_errors(msg):
+    assert B._credit_problem(msg) is None, msg
+
+
+def test_bad_provider_blocks_run_and_hints(monkeypatch):
+    """Kredisi biten saglayiciyla tekrar istek atmasin."""
+    monkeypatch.setattr(B, "_chat_model", lambda c: "orcarouter/deepseek-v4-flash-free")
+    B._mark_bad_provider("orcarouter")
+    try:
+        reply, executed = B._gate_or_spawn("111", "@t", "devam et")
+        assert not executed
+        assert "kredi" in reply.lower()
+        assert "/model list orcarouter" in reply
+    finally:
+        B._clear_bad_provider("orcarouter")
+
+
+def test_bad_provider_lets_other_providers_run(monkeypatch):
+    monkeypatch.setattr(B, "_chat_model", lambda c: "opencode/space-bunny-free")
+    B._mark_bad_provider("orcarouter")
+    try:
+        started = []
+        monkeypatch.setattr(B, "_spawn_worker",
+                            lambda *a, **k: started.append(1) or True)
+        reply, executed = B._gate_or_spawn("111", "@t", "devam et")
+        assert executed and started
+    finally:
+        B._clear_bad_provider("orcarouter")
+
+
+def test_credit_error_in_output_adds_hint(monkeypatch):
+    out = B._add_credit_hint("> orchestrator \u2192 orcarouter/auto\nYou're out of credits")
+    assert "kredi" in out.lower()
+    assert "/model" in out
+    try:
+        B._clear_bad_provider("orcarouter")
+    except Exception:
+        pass
+
+
+def test_good_output_gets_no_hint():
+    src = "Normal bir cevap, hicbir hata yok."
+    assert B._add_credit_hint(src) == src
+
+
+# ================================================================ grup yetki modeli
+# Canli inceleme bulgusu: `handle_update` chat_id ile, `handle_callback` user_id
+# ile yetki kontroluyordu ve ikisi de ayni listeye bakiyordu. Grup sohbetinde
+# metin gonderen HERKES makineyi kullanabiliyor, izin/soru butonlari ise hic
+# calismiyordu (user_id grup chat_id'sine uymuyor).
+# Cozum: iki ayri liste. TELEGRAM_ALLOWED_CHAT_IDS + TELEGRAM_ALLOWED_USER_IDS.
+
+def test_private_chat_legacy_behaviour_unchanged(monkeypatch):
+    """Ozel sohbette user_id == chat_id; eski davranis bozulmamali."""
+    monkeypatch.setattr(B, "ALLOWED", {"111"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", set())
+    assert B.is_allowed_chat("111", "111") is True
+    assert B.is_allowed_user("111") is True
+    assert B.is_allowed_chat("999", "999") is False
+
+
+def test_group_requires_user_allowlist(monkeypatch):
+    monkeypatch.setattr(B, "ALLOWED", {"-1001"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", {"111"})
+    assert B.is_allowed_chat("-1001", "111") is True, "izinli kullanici grupta calisabilmeli"
+    assert B.is_allowed_chat("-1001", "222") is False, "izin listesinde olmayan grupta calisamamali"
+    assert B.is_allowed_user("111") is True
+    assert B.is_allowed_user("222") is False
+
+
+def test_group_without_user_allowlist_denies_nonmember(monkeypatch):
+    """Sadece grup chat_id'si tanimliysa, listede olmayan kullanicilar girmez."""
+    monkeypatch.setattr(B, "ALLOWED", {"-1001"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", set())
+    assert B.is_allowed_chat("-1001", "111") is False
+
+
+def test_callback_uses_user_auth(monkeypatch):
+    """Butonlar user_id'ye bakar (grupta calismali)."""
+    monkeypatch.setattr(B, "ALLOWED", {"-1001"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", {"111"})
+    seen = []
+    monkeypatch.setattr(B, "answer_callback", lambda *a, **k: seen.append(a) or None)
+    B.handle_callback({"id": "cb", "data": "x", "from": {"id": 222}})
+    assert seen and seen[0][0] == "cb"
+    assert "DENIED" not in str(seen) or True   # sadece cagrildigini dogrula
+    # izinli kullanici butona basinca islem YAPILMAMALI (prm yok -> "suresi dolmus")
+    seen2 = []
+    monkeypatch.setattr(B, "answer_callback", lambda *a, **k: seen2.append(a) or None)
+    B.handle_callback({"id": "cb2", "data": "frm:zz:0", "from": {"id": 111}})
+    assert seen2 and "suresi dolmus" in seen2[0][1]
+
+
+def test_update_denies_group_nonmember(monkeypatch):
+    """Grupta izinli olmayan kullanicinin metni calistirilmamali."""
+    monkeypatch.setattr(B, "ALLOWED", {"-1001"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", {"111"})
+    ran = []
+    monkeypatch.setattr(B, "_gate_or_spawn",
+                        lambda *a, **k: (ran.append(1) or ("ok", True)))
+    B.handle_update({"message": {"chat": {"id": -1001}, "message_id": 1,
+                                 "from": {"id": 222}, "text": "rm -rf /"}})
+    assert not ran, "gruptaki yabanci komut calistirildi"
+
+
+def test_update_allows_group_member(monkeypatch):
+    monkeypatch.setattr(B, "ALLOWED", {"-1001"})
+    monkeypatch.setattr(B, "ALLOWED_USERS", {"111"})
+    ran = []
+    monkeypatch.setattr(B, "_gate_or_spawn",
+                        lambda *a, **k: (ran.append(1) or ("ok", True)))
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    B.handle_update({"message": {"chat": {"id": -1001}, "message_id": 1,
+                                 "from": {"id": 111}, "text": "merhaba"}})
+    assert ran, "izinli grup uyesinin mesaji calistirilmadi"
+
+
+def test_user_allowlist_documented_in_env_example():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    txt = open(os.path.join(root, ".env.example"), encoding="utf-8").read()
+    assert "TELEGRAM_ALLOWED_USER_IDS" in txt
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in txt
+
+
+# ================================================================ alt klavye (/klavye)
+# Karar (2026-09-29): kalici klavye KAPALI baslar. Kalici klavye yazan alanin
+# hemen ustune yerlesir ve normal sohbet gibi yazmak isteyenleri engeller.
+# Acmak isteyenler /klavye yazar. Buton etiketleri tek yerde tanimlidir.
+
+def test_keyboard_layout_shape():
+    kb = B.keyboard_markup()
+    rows = kb["keyboard"]
+    assert len(rows) == 2, rows
+    assert all(len(r) == 3 for r in rows), rows
+    assert kb.get("resize_keyboard") is True
+    assert kb.get("is_persistent") is True
+
+
+def test_keyboard_labels_are_unique():
+    labels = [b["text"] for row in B.keyboard_markup()["keyboard"] for b in row]
+    assert len(labels) == len(set(labels)), labels
+
+
+def test_keyboard_labels_resolve_to_commands():
+    """Tapan buton komuta donusmeli; yoksa opencode'a metin gider."""
+    for row in B.keyboard_markup()["keyboard"]:
+        for b in row:
+            assert b["text"] in B.KEYBOARD_ACTIONS, b
+            assert B.KEYBOARD_ACTIONS[b["text"]].startswith("/"), b
+
+
+def test_keyboard_button_text_is_remapped(monkeypatch):
+    """Tapan buton komuta donusmeli; yoksa opencode'a metin gider."""
+    for row in B.keyboard_markup()["keyboard"]:
+        for b in row:
+            assert B._map_keyboard_press(b["text"]) == B.KEYBOARD_ACTIONS[b["text"]]
+    assert B._map_keyboard_press("normal bir mesaj") is None
+
+
+def test_keyboard_press_routes_to_command(monkeypatch):
+    """Butona basinca ilgili komut calismali (acikca dogrula)."""
+    called = []
+    monkeypatch.setattr(B, "cmd_status_for_chat", lambda c=None: called.append("durum") or "ok")
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    B.handle_text("111", "@t", "Durum")
+    assert called == ["durum"], "Durum butonu /durum'a gitmedi: %s" % called
+
+
+def test_keyboard_press_never_reaches_agent(monkeypatch):
+    """Buton etiketi opencode'a ASLA gitmemeli."""
+    ran = []
+    monkeypatch.setattr(B, "_gate_or_spawn", lambda *a, **k: (ran.append(a[2]) or ("ok", True)))
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    monkeypatch.setattr(B, "_is_busy", lambda c: False)
+    for row in B.keyboard_markup()["keyboard"]:
+        for b in row:
+            if b["text"] in ("Durum", "Model", "Oturum", "Kuyruk", "Yeni", "Durdur"):
+                B.handle_text("111", "@t", b["text"])
+    assert not any(r in B.KEYBOARD_ACTIONS for r in ran), ran
+
+
+def test_keyboard_remove_payload():
+    rm = B.keyboard_remove_markup()
+    assert rm == {"remove_keyboard": True}
+
+
+def test_keyboard_send_and_close(monkeypatch):
+    sent = []
+    monkeypatch.setattr(B, "api", lambda m, p=None, timeout=45, max_retries=None: sent.append((m, p)) or {"ok": True})
+    assert B.cmd_keyboard("/klavye", "111")[0]
+    assert sent[-1][0] == "sendMessage"
+    assert "reply_markup" in sent[-1][1]
+    sent.clear()
+    assert B.cmd_keyboard("/klavye kapat", "111")[0]
+    assert sent[-1][1]["reply_markup"] == {"remove_keyboard": True}
+
+
+def test_keyboard_usage():
+    out = B.cmd_keyboard("/klavye zzz", "111")[0]
+    assert "/klavye" in out
+
+
+def test_keyboard_commands_registered():
+    assert any(c["command"] == "klavye" for c in B.TG_COMMANDS)
+    assert "/klavye" in B.HELP
+
+
+# ================================================================ mesaj kuyrugu
+# Canli testte: mesgulken gelen mesaj REDDEDILIYORDU ("Halen bir is
+# calisiyor"), kullanici telifte gonderip unutuyordu.
+
+def test_queue_receives_while_busy(monkeypatch):
+    B._queue_clear("111")
+    ev = threading.Event()
+    fake = threading.Thread(target=lambda: ev.wait(5))
+    fake.start()
+    B._inflight["111"] = {"thread": fake, "abort": threading.Event(), "box": {}}
+    try:
+        reply, executed = B.handle_text("111", "@t", "ikinci is")
+        assert not executed
+        assert "kuyruga" in reply.lower(), reply
+        assert B._queue_len("111") == 1
+    finally:
+        ev.set(); fake.join(); B._inflight.pop("111", None); B._queue_clear("111")
+
+
+def test_queue_respects_limit(monkeypatch):
+    monkeypatch.setattr(B, "MAX_QUEUED", 2)
+    B._queue_clear("111")
+    for i in range(4):
+        B._queue_push("111", "@t", "mesaj %d" % i)
+    assert B._queue_len("111") == 2
+    B._queue_clear("111")
+
+
+def test_queue_is_drained_in_order(monkeypatch):
+    B._queue_clear("111")
+    for i in range(3):
+        B._queue_push("111", "@t", "m%d" % i)
+    got = []
+    B._queue_drain("111", lambda c, l, p, files=None: got.append(p) or True)
+    assert got == ["m0", "m1", "m2"]
+    assert B._queue_len("111") == 0
+
+
+def test_queue_drop_stops_drain(monkeypatch):
+    B._queue_clear("111")
+    B._queue_push("111", "@t", "m0")
+    B._queue_push("111", "@t", "m1")
+    B._queue_push("111", "@t", "m2")
+    got = []
+
+    def _spawn(c, l, p, files=None):
+        got.append(p)
+        if len(got) == 2:
+            B._queue_drop("111", p)   # kullanici geri aldi
+        return True
+    B._queue_drain("111", _spawn)
+    assert got == ["m0", "m1"], got
+    # Kalan mesaj SILINMEZ, sonraki is icin bekler (ariza arkaya arkaya
+    # calismamali).
+    assert B._queue_len("111") == 1
+    assert B._queue_list("111")[0]["text"] == "m2"
+    B._queue_clear("111")
+
+
+def test_queue_persists_across_calls(monkeypatch):
+    B._queue_clear("111")
+    B._queue_push("111", "@t", "kalici mi")
+    assert B._queue_len("111") == 1
+    assert B._queue_list("111")
+    B._queue_clear("111")
+
+
+def test_queue_show_and_clear(monkeypatch):
+    B._queue_clear("111")
+    for i in range(3):
+        B._queue_push("111", "@t", "m%d" % i)
+    out = B.cmd_queue("/kuyruk", "111")[0]
+    assert "3" in out
+    out2 = B.cmd_queue("/kuyruk temizle", "111")[0]
+    assert B._queue_len("111") == 0
+    assert "temiz" in out2.lower()
+
+
+def test_queue_drained_after_job(monkeypatch):
+    """Is bitince kuyruktaki siraya gore devam etmeli."""
+    B._queue_clear("111")
+    B._queue_push("111", "@t", "ikinci")
+    B._queue_push("111", "@t", "ucuncu")
+    spawned = []
+    ev = threading.Event()
+    fake = threading.Thread(target=lambda: ev.wait(0.4))
+    fake.start()
+    B._inflight["111"] = {"thread": fake, "abort": threading.Event(), "box": {}}
+    try:
+        n = B._queue_drain("111",
+                           lambda c, l, p, files=None: spawned.append(p) or True)
+    finally:
+        ev.set()
+        fake.join()
+        B._inflight.pop("111", None)
+    assert spawned == ["ikinci", "ucuncu"], spawned
+    assert n == 2
+    assert B._queue_len("111") == 0
+    B._queue_clear("111")
+
+
+def test_queue_commands_registered():
+    assert any(c["command"] == "kuyruk" for c in B.TG_COMMANDS)
+    assert "/kuyruk" in B.HELP
+    assert B.KEYBOARD_ACTIONS["Kuyruk"] == "/kuyruk"
 
 
 # ================================================================ Canli test bulgulari

@@ -6,7 +6,7 @@ inclusion: manual
 
 Telegram koprusu iki yonludur: `telegram` MCP (opencode tarafi) + `bridge/bridge.py` (daemon).
 Bu dosya TUI icinde calisan orchestrator ve worker'larin uymasi gereken kurallari tanimlar.
-Detayli kurulum: `TELEGRAM-KURULUM.md`.
+Detayli kurulum: `docs/KURULUM.md`.
 
 ## Roller
 
@@ -31,9 +31,15 @@ Detayli kurulum: `TELEGRAM-KURULUM.md`.
 
 ## Worker Kurallari
 
-- Telegram'a dogrudan yazma; orchestrator'a `mail_send` ile rapor ver, gonderimi o yapar.
-- Kullanici onayi gereken islerde BLOCKED raporu + `re` (task ID) yaz; orchestrator Telegram'dan
+- Telegram'a dogrudan yazma; orchestrator'a `telegram_send` ile rapor ver, gonderimi o yapar.
+- Kullanici onayi gereken islerde BLOCKED raporu + task ID yaz; orchestrator Telegram'dan
   `/onay` gelince devam eder.
+
+## Bu pakette olmayanlar
+
+Team-template'den kalan referanslar (bu pakette YOK, kullanma):
+`mail_send` tool'u, `inbox.json` tabanli `/roster` ve `/gelen` komutlari, `telegram-ops`
+disindaki steering dosyalari. Bu paket tek basina durur; ekip araclari opsiyoneldir.
 
 ## Guvenlik
 

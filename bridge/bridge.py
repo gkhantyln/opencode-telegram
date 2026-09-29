@@ -123,6 +123,15 @@ except ValueError:
 BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
 _raw_allowed = env("TELEGRAM_ALLOWED_CHAT_IDS", "").replace(";", ",")
 ALLOWED = {c.strip() for c in _raw_allowed.split(",") if c.strip()}
+# Kullanici (user_id) izin listesi. Bos ise geriye donus: chat_id = user_id
+# olan OZEL sohbetlerde eski davranis (user_id chat_id'ye bakilir).
+#
+# Canli inceleme bulgusu: yetki kontrolu tutarsizti. Metin mesajlari chat_id
+# ile, inline butonlar user_id ile kontrol ediliyordu ve ikisi de ayni
+# listeye bakiyordu. Grup sohbetinde metin gonderen HERKES makineyi
+# kullanabiliyor, butonlar ise hic calismiyordu.
+_raw_users = env("TELEGRAM_ALLOWED_USER_IDS", "").replace(";", ",")
+ALLOWED_USERS = {c.strip() for c in _raw_users.split(",") if c.strip()}
 DEFAULT_CHAT = env("TELEGRAM_DEFAULT_CHAT_ID", "").strip()
 
 
@@ -597,8 +606,225 @@ def _edit_chunk(chat_id, message_id, text, parse_mode=None):
         return False
 
 
-def is_allowed(chat_id):
-    return str(chat_id) in ALLOWED
+# ---------- alt klavye (reply keyboard) ----------
+#
+# Karar (2026-09-29): kalici klavye KAPALI baslar. Kalici klavye yazan alanin
+# hemen ustune yerlesir ve "haricinde bir sey de yazabilir" degildir; normal
+# sohbet gibi kullanmak isteyenleri engeller. `/klavye` ile acilir, kapatilir.
+#
+# Buton etiketleri tek yerde. TIKLANAN buton metni opencode'a gitmemeli,
+# once komuta donusdurulur (KEYBOARD_ACTIONS).
+KEYBOARD_ROWS = [
+    ["Durum", "Model", "Oturum"],
+    ["Kuyruk", "Yeni", "Durdur"],
+]
+KEYBOARD_ACTIONS = {
+    "Durum": "/durum",
+    "Model": "/model",
+    "Oturum": "/sessions",
+    "Kuyruk": "/kuyruk",
+    "Yeni": "/sessions yeni",
+    "Durdur": "/abort",
+}
+
+
+def keyboard_markup():
+    """Kalici alt klavye (2 satir x 3 buton)."""
+    return {
+        "keyboard": [[{"text": lbl} for lbl in row] for row in KEYBOARD_ROWS],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "bir is yaz veya bir dugmeye dokun",
+    }
+
+
+def keyboard_remove_markup():
+    return {"remove_keyboard": True}
+
+
+def cmd_keyboard(text, chat_id):
+    """`/klavye` — alt klavye ac / kapat. Donus: (cevap, calistirildi_mi)."""
+    arg = text.strip().split()[1].lower() if len(text.strip().split()) > 1 else ""
+    if arg in ("kapat", "off", "kapatis", "hayir", "no"):
+        try:
+            api("sendMessage", {"chat_id": str(chat_id), "text": "Alt klavye kapatildi.",
+                                "reply_markup": keyboard_remove_markup()})
+            return "Alt klavye kapatildi.", False
+        except Exception as e:  # noqa: BLE001
+            return "Kapatilamadi: %s" % str(e)[-150:], False
+    if arg in ("ac", "on", "acil", "evet", "yes", ""):
+        model = _chat_model(chat_id) or "(varsayilan)"
+        try:
+            api("sendMessage", {
+                "chat_id": str(chat_id),
+                "text": ("Alt klavye acik. Dugmeler sana hizli kisa yol verir; "
+                         "yine de istedigin yere yazabilirsin.\n"
+                         "Aktif model: %s" % model),
+                "reply_markup": keyboard_markup()})
+            return "Alt klavye acik.", False
+        except Exception as e:  # noqa: BLE001
+            return "Acilamadi: %s" % str(e)[-150:], False
+    return ("Kullanim:\n"
+            "  /klavye           alt klavye ac\n"
+            "  /klavye kapat     alt klavye kapat\n"
+            "  /kuyruk          bekleyen mesajlar\n"
+            "  /kuyruk temizle  kuyrugu bosalt"), False
+
+
+# ---------- mesaj kuyrugu (mesgulken gelen mesajlar) ----------
+#
+# Canli testte mesgulken gelen mesaj REDDEDILIYORDU; kullanici telifte
+# gonderip unutuyordu. Artik kuyruga alinir, is bitince sirayla calisir ve
+# `/kuyruk` ile gorulup temizlenebilir.
+MAX_QUEUED = max(1, int(env("TELEGRAM_MAX_QUEUED", "5") or 5))
+QUEUE_FILE = os.path.join(MAILBOX_DIR, "telegram_queue.json")
+
+
+def _queue_all():
+    st = _load(QUEUE_FILE, {})
+    return st if isinstance(st, dict) else {}
+
+
+def _queue_list(chat_id):
+    items = _queue_all().get(str(chat_id))
+    return list(items) if isinstance(items, list) else []
+
+
+def _queue_len(chat_id):
+    return len(_queue_list(chat_id))
+
+
+def _queue_push(chat_id, label, text, files=None):
+    """Kuyruga ekle. Donus: (kabul_edildi, aciklama)."""
+    with _aj.tx(QUEUE_FILE):
+        st = _queue_all()
+        items = st.get(str(chat_id))
+        items = list(items) if isinstance(items, list) else []
+        if len(items) >= MAX_QUEUED:
+            st[str(chat_id)] = items
+            _save(QUEUE_FILE, st)
+            return False, ("Kuyruk dolu (%d mesaj). Bitmesini bekle ya da "
+                           "/kuyruk temizle." % MAX_QUEUED)
+        items.append({"text": text, "from": label, "files": files or [],
+                      "ts": time.time()})
+        st[str(chat_id)] = items
+        _save(QUEUE_FILE, st)
+    return True, "Kuyruga alindi (%d/%d)." % (len(items), MAX_QUEUED)
+
+
+def _queue_drop(chat_id, text):
+    """Kuyruktan tek bir mesaji cikar (kullanici geri aldi)."""
+    with _aj.tx(QUEUE_FILE):
+        st = _queue_all()
+        items = st.get(str(chat_id))
+        items = list(items) if isinstance(items, list) else []
+        items = [m for m in items if m.get("text") != text]
+        if items:
+            st[str(chat_id)] = items
+        else:
+            st.pop(str(chat_id), None)
+        _save(QUEUE_FILE, st)
+    return True
+
+
+def _queue_clear(chat_id):
+    with _aj.tx(QUEUE_FILE):
+        st = _queue_all()
+        st.pop(str(chat_id), None)
+        _save(QUEUE_FILE, st)
+
+
+def _queue_drain(chat_id, spawn):
+    """Kuyrugu sirayla bosalt; spawn basarisiz olursa veya kuyruk degisirse DURUR.
+
+    `spawn(chat_id, label, text, files)` -> bool. Donus: baslatilan adet.
+    """
+    n = 0
+    while True:
+        pending = _queue_list(chat_id)
+        if not pending:
+            return n
+        item = pending[0]
+        if not spawn(chat_id, item.get("from", "queue"),
+                     item.get("text", ""), item.get("files")):
+            return n
+        head = _queue_list(chat_id)
+        if not head or head[0].get("text") != item.get("text"):
+            # Kuyrugun basi degisti: kullanici mesaji geri aldi ya da
+            # temizledi. Donguyu KIR - isleri arka arkaya calistirma.
+            return n
+        _queue_drop(chat_id, item.get("text", ""))
+        n += 1
+
+
+def cmd_queue(text, chat_id):
+    """`/kuyruk` — bekleyen mesajlari goster / temizle."""
+    arg = text.strip().split()[1].lower() if len(text.strip().split()) > 1 else ""
+    if arg in ("temizle", "sil", "bosalt", "clear", "iptal"):
+        n = _queue_len(chat_id)
+        _queue_clear(chat_id)
+        return ("Kuyruk temizlendi (%d mesaj silindi)." % n) if n else "Kuyruk zaten bos.", False
+    items = _queue_list(chat_id)
+    if not items:
+        return ("Kuyruk bos (%d/%d). Mesgulken gonderdigin mesajlar buraya "
+                "alnir ve sirayla calisir." % (0, MAX_QUEUED)), False
+    out = ["Kuyruk: %d/%d mesaj" % (len(items), MAX_QUEUED)]
+    for i, m in enumerate(items, 1):
+        t = (m.get("text") or "").replace("\n", " ")
+        out.append("  %d. (%s) %s" % (i, _tshort((m.get("ts") or 0) * 1000), t[:80]))
+    out.append("")
+    out.append("Is bitince sirayla calisir. Temizle: /kuyruk temizle")
+    return "\n".join(out), False
+
+
+def is_allowed(chat_id, user_id=None):
+    """Geriye donus uyumu: tek arguman gelirse chat_id kontrolu yapilir.
+
+    Tercih edilen yeni arayuz `is_allowed_chat` / `is_allowed_user`.
+    """
+    return is_allowed_chat(chat_id, user_id)
+
+
+def is_allowed_chat(chat_id, user_id=None):
+    """Bu sohbetteki kullanicinin komut gonderme yetkisi var mi?
+
+    - Chat `ALLOWED` (chat id) listesinde olmali.
+    - `ALLOWED_USER_IDS` doluysa kullanicida o listede olmali. Boylece grup
+      sohbetinde listenin disindaki kisi makineyi kullanamaz.
+    - `ALLOWED_USER_IDS` bossa geriye donus: ozel sohbetlerde user_id == chat_id
+      oldugu icin onceki davranis korunur; grupta ise yabanci reddedilir.
+    """
+    if str(chat_id) not in ALLOWED:
+        return False
+    if user_id is None:
+        return True
+    uid = str(user_id)
+    if ALLOWED_USERS:
+        return uid in ALLOWED_USERS
+    # Kullanici listesi tanimli degilse: ayni sohbetin uyesi olmak yeterli
+    # (ozel sohbet) ya da sohbet ID'si user_id ile ayni (geriye donus).
+    return uid == str(chat_id) or _group_member_ok(chat_id, uid)
+
+
+def is_allowed_user(user_id):
+    """Inline buton icin: kullanici yetkisi.
+
+    `ALLOWED_USER_IDS` doluysa sadece o kullanicilar. Bos ise geriye donus:
+    user_id, izinli chat id'leriyle eslesiyorsa (ozel sohbet) gecer.
+    """
+    uid = str(user_id)
+    if ALLOWED_USERS:
+        return uid in ALLOWED_USERS
+    return uid in ALLOWED
+
+
+def _group_member_ok(chat_id, user_id):
+    """Grup sohbetinde `ALLOWED_USER_IDS` tanimli degilse kimse giremez.
+
+    Guvenli varsayilan: izin listesinde acikca yazilmayan kisi makineyi
+    calistiramaz. Grubu kullanmak icin `TELEGRAM_ALLOWED_USER_IDS` zorunludur.
+    """
+    return False
 
 
 # ---------- inbox/outbox ----------
@@ -804,9 +1030,11 @@ HELP = (
     "/project — proje listele/sec (cok projeli kullanimda)\n"
     "/model — aktif model | /model list [filtre] [sayfa] | /model set <p/m>\n"
     "/sessions [sayfa] — oturum listesi | /sessions ac <no> gec | /sessions yeni\n"
+    "/kuyruk [temizle] — mesgulken gonderilen mesajlar | /klavye — alt klavye ac/kapat\n"
     "/yardim — bu liste\n\n"
     "Duz mesaj = /sor. Fotograf/belge gonderebilirsin (incelenir). "
-    "Her chat'te ayni anda tek is calisir."
+    "Her chat'te ayni anda tek is calisir; mesgulken gonderdigin mesajlar "
+    "kuyruga alinir."
 )
 
 # ---------- Telegram komut menusu (GAP-B) ----------
@@ -825,6 +1053,8 @@ TG_COMMANDS = [
     {"command": "reset", "description": "Telegram oturumunu sifirla"},
     {"command": "model", "description": "Model gor / listele / degistir"},
     {"command": "sessions", "description": "Oturumlari listele / gec / yeni olustur"},
+    {"command": "kuyruk", "description": "Bekleyen mesajlar (mesgulken gonderilenler)"},
+    {"command": "klavye", "description": "Alt klavye ac / kapat"},
     {"command": "project", "description": "Proje listele / sec"},
     {"command": "roster", "description": "Agent canlilik durumu"},
     {"command": "gelen", "description": "Okunmamis team-mailbox mesajlari"},
@@ -1143,13 +1373,50 @@ def progressive_throttle(elapsed_sec):
     return 10.0
 
 
+def _serve_alive(c):
+    """Cache'lenmis istemci hala konusabiliyor mu?"""
+    try:
+        c._req("GET", "/api/info", timeout=8)
+        return True
+    except Exception:
+        return False
+
+
+def _serve_proc_alive():
+    return _serve_proc is not None and _serve_proc.poll() is None
+
+
+def _serve_stop():
+    """Bizim baslattigimiz serve surecini kapat (copru birakma)."""
+    global _serve_proc
+    p = _serve_proc
+    _serve_proc = None
+    if p is None:
+        return
+    try:
+        if p.poll() is None:
+            _kill_tree(p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _serve(directory=None):
-    """ServeClient (dizin bazinda cache); ulasilamiyorsa serve'i ayaga kaldirir."""
+    """ServeClient (dizin bazinda cache); ulasilamiyorsa serve'i ayaga kaldirir.
+
+    Canli test bulgusu: cache'lenmis istemci saglik kontrolu yapmadan geri
+    veriliyordu. Serve olunce (ya da baska bir surec portu kaparsa) kopru
+    kalici olarak kilitleniyor, kurtarmak icin elle yeniden baslatmak
+    gerekiyordu. Artik olmus istemci dusurulup yeniden kuruluyor.
+    """
     global _serve_proc
     import serve_client as _sc
     directory = directory or PROJECT_DIR
-    if directory in _serve_clients:
-        return _serve_clients[directory]
+    cached = _serve_clients.get(directory)
+    if cached is not None:
+        if _serve_alive(cached):
+            return cached
+        _serve_clients.pop(directory, None)
+        log("serve baglantisi koptu, yeniden deneniyor")
     pw = SERVE_PASSWORD or ("tg-local-%d" % (int(time.time()) % 1000000))
     c = _sc.ServeClient(SERVE_URL, pw, directory)
     try:
@@ -1489,6 +1756,7 @@ def run_opencode(prompt, chat_id, from_label, files=None, abort=None, proc_box=N
         out = "HATA (exit %d): %s" % (p.returncode, (p.stderr or "")[-1500:])
         _debug_log("RUN-FAIL chat=%s stored=%s rc=%d\nSTDOUT-tail: %s\nSTDERR-full:\n%s" % (
             chat_id, stored, p.returncode, (p.stdout or "")[-500:], p.stderr or ""))
+    out = _add_credit_hint(out)
     return out
 
 
@@ -1587,6 +1855,18 @@ def _spawn_worker(chat_id, from_label, prompt, files=None, reply_to=None):
                 cur = _inflight.get(str(chat_id))
                 if cur is not None and cur.get("abort") is abort:
                     _inflight.pop(str(chat_id), None)
+            # Kuyruktaki sirayi devam ettir (is bitti, slot bosaldi).
+            # Kuyrugu bosaltan sey geri birakirsa dongu KIRILIR: kullanici
+            # /kuyruk temizle dediyse veya is artik calismiyorsa.
+            try:
+                def _drain_spawn(c, lbl, prompt, files=None):
+                    return _spawn_worker(c, lbl, prompt, files=files)
+
+                n = _queue_drain(str(chat_id), _drain_spawn)
+                if n:
+                    log("kuyruktan %d mesai calistirildi" % n)
+            except Exception as e:  # noqa: BLE001
+                log("kuyruk bosaltilamadi: %s" % str(e)[-150:])
 
     th = threading.Thread(target=_run, daemon=True)
     with _inflight_lock:
@@ -2039,8 +2319,21 @@ def cmd_project(text, chat_id):
     return "Kullanim: /project list | /project current | /project set <alias>"
 
 
+def _map_keyboard_press(text):
+    """Alt klavye dugmesi metnini komuta cevir. Diger degilse None.
+
+    Butona basilinca gonderilen metin opencode'a GONDERILMEZ; once burada
+    komuta donusur, yoksa ajan "Durum" yazan bir mesaj alir.
+    """
+    return KEYBOARD_ACTIONS.get((text or "").strip())
+
+
 def handle_text(chat_id, from_label, text, reply_to=None):
     t = text.strip()
+    mapped = _map_keyboard_press(t)
+    if mapped:
+        t = mapped
+        text = mapped
     low = t.lower()
     if low in ("/start", "/yardim", "/help", "yardim"):
         return HELP, False
@@ -2058,6 +2351,10 @@ def handle_text(chat_id, from_label, text, reply_to=None):
         return cmd_model(t, chat_id), False
     if low == "/sessions" or low.startswith("/sessions ") or low.startswith("/sessions@"):
         return cmd_sessions(t, chat_id), False
+    if low == "/klavye" or low.startswith("/klavye ") or low.startswith("/klavye@"):
+        return cmd_keyboard(t, chat_id)
+    if low == "/kuyruk" or low.startswith("/kuyruk ") or low.startswith("/kuyruk@"):
+        return cmd_queue(t, chat_id)
     if low == "/project" or low.startswith("/project ") or low.startswith("/project@"):
         return cmd_project(t, chat_id), False
     if low.startswith("/onay"):
@@ -2284,6 +2581,18 @@ try:
     DAILY_TOKEN_LIMIT = int(env("TELEGRAM_DAILY_TOKEN_LIMIT", "0"))
 except ValueError:
     DAILY_TOKEN_LIMIT = 0
+# Ust uste hata toleransi: bu kadar ardisik hatada kopru donmus sayilir,
+# olu bildirimi gonderilir ve surec durur (LOOP_MAX_CONSECUTIVE_ERRORS).
+try:
+    LOOP_MAX_CONSECUTIVE_ERRORS = max(2, int(
+        env("TELEGRAM_LOOP_MAX_ERRORS", "5")))
+except ValueError:
+    LOOP_MAX_CONSECUTIVE_ERRORS = 5
+# Kredisi biten saglayici bu sure sonra tekrar denenir.
+try:
+    BAD_PROVIDER_TTL = max(600.0, float(env("TELEGRAM_BAD_PROVIDER_TTL_H", "6")) * 3600)
+except ValueError:
+    BAD_PROVIDER_TTL = 6 * 3600
 
 
 def _today():
@@ -2350,12 +2659,119 @@ def _budget_exceeded():
     return None
 
 
+# ---------- saglayici kredisi / kota uyarisi ----------
+#
+# Canli test bulgusu: opencode'nin "You're out of credits" hatasi kullaniciya
+# duz metin olarak gidiyordu; kullanici fark etmeden ikinci mesaji da ayni
+# hatayla yedi. Artik (1) hataya ipucu ekleniyor, (2) kredisi biten saglayici
+# isaretleniyor ve (3) o saglayiciyla yeni istek ATILMIYOR.
+
+CREDIT_PATTERNS = [
+    r"out of credits",
+    r"insufficient[ _]quota",
+    r"quota (?:exceeded|exhausted)",
+    r"payment required",
+    r"\b402\b",
+    r"add credits",
+    r"billing limit",
+    r"no (?:available )?credits?",
+    r"exceeded your current quota",
+]
+_CREDIT_RE = re.compile("|".join(CREDIT_PATTERNS), re.IGNORECASE)
+# opencode hata basligi: "> orchestrator -> orcarouter/auto"
+# Ok isareti (U+2192) duz karakter yerine \u2192 kacisiyla yazildi: kaynak
+# dosya ASCII kalir, eslesme ayni.
+_PROVIDER_RE = re.compile(r"^>\s*\S+\s*(?:\u2192|->)\s*([\w.\-]+)/", re.MULTILINE)
+
+BAD_PROVIDERS_FILE = os.path.join(MAILBOX_DIR, "telegram_bad_providers.json")
+
+
+def _credit_problem(text):
+    """Cikti kredi/kota hatasi iceriyor mu? Ise ilgili saglayici adi (yoksa "")."""
+    if not text or not _CREDIT_RE.search(text):
+        return None
+    m = _PROVIDER_RE.search(text)
+    return (m.group(1) if m else "")
+
+
+def _bad_providers():
+    st = _load(BAD_PROVIDERS_FILE, {})
+    return {k: v for k, v in st.items() if isinstance(v, (int, float))} \
+        if isinstance(st, dict) else {}
+
+
+def _mark_bad_provider(provider):
+    if not provider:
+        return
+    try:
+        with _aj.tx(BAD_PROVIDERS_FILE):
+            st = _bad_providers()
+            st[provider] = time.time()
+            _save(BAD_PROVIDERS_FILE, st)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _clear_bad_provider(provider):
+    try:
+        with _aj.tx(BAD_PROVIDERS_FILE):
+            st = _bad_providers()
+            st.pop(provider, None)
+            _save(BAD_PROVIDERS_FILE, st)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _model_provider():
+    m = (_chat_model("") or "").strip()
+    return m.split("/", 1)[0] if "/" in m else ""
+
+
+def _bad_provider_for_model(model):
+    """Verilen modelin saglayicisi kredisi bitmis mi? (model bos ise global)"""
+    prov = model.split("/", 1)[0] if model and "/" in model else _model_provider()
+    if not prov:
+        return None
+    st = _bad_providers()
+    ts = st.get(prov)
+    if not ts:
+        return None
+    # 6 saat sonra yeniden dene: saglayici krediyi yenilemis olabilir
+    return prov if time.time() - float(ts) < BAD_PROVIDER_TTL else None
+
+
+def _add_credit_hint(text):
+    """Kredi hatasina kullanim ipucu ekle (ve saglayiciyi isaretle)."""
+    prov = _credit_problem(text)
+    if prov is None:
+        return text
+    _mark_bad_provider(prov)
+    hint = ("\n\n--- %s: bu saglayicinin kredisi bitmis. Ayni hatayi tekrar "
+            "etmemek icin: /model list %s  sonra /model set <provider/model>"
+            % (prov or "Saglayici", prov or "<provider>"))
+    return (text or "") + hint
+
+
 def _gate_or_spawn(chat_id, label, prompt, files=None, reply_to=None):
-    """Yikici icerikse HOLD'a al, yoksa worker baslat. Donus: (reply, executed)."""
+    """Is baslat: sirada varsa kuyruga al, degilse calistir. Donus: (reply, executed)."""
     used = _budget_exceeded()
     if used is not None:
         return ("Gunluk token limiti asildi (%d/%d). Yarin devam ederiz "
                 "(TELEGRAM_DAILY_TOKEN_LIMIT)." % (used, DAILY_TOKEN_LIMIT), False)
+    bad = _bad_provider_for_model(_chat_model(chat_id))
+    if bad:
+        # Kredisi biten saglayiciya yeni istek atmak para/harcama kaybi demek
+        return ("Durduruldu: '%s' saglayicisinin kredisi bitmis.\n"
+                "Bu hatayi tekrar etmemek icin once model degistir:\n"
+                "  /model list %s   -   /model set <provider/model>\n"
+                "  (6 saat sonra otomatik yeniden denenir)" % (bad, bad), False)
+    if _is_busy(chat_id):
+        # Canli test bulgusu: mesgulken gelen mesaj reddediliyordu, kullanici
+        # telifte gonderip unutuyordu. Artik kuyruga alinir.
+        ok, msg = _queue_push(chat_id, label, prompt, files)
+        if not ok:
+            return (msg + "  (Aktif is bitmeden yeni is calismaz.)", False)
+        return (msg + "  Is bitince sirayla calisacak. Iptal: /kuyruk temizle", False)
     danger = _check_dangerous(prompt)
     if danger:
         hid = _hold_create(chat_id, label, prompt, files)
@@ -2364,8 +2780,6 @@ def _gate_or_spawn(chat_id, label, prompt, files=None, reply_to=None):
         return ("Duraklatildi: '%s' yakalandi.\n\nOngosterim: %s\n\n"
                 "Devam icin: /onay %s (30 dk gecerli)\nVazgecmek icin: gormezden gel." % (
                     danger, prompt[:200], hid), False)
-    if _is_busy(chat_id):
-        return "Halen bir is calisiyor. Bitmesini bekle ya da /abort ile durdur.", False
     if _spawn_worker(chat_id, label, prompt, files=files, reply_to=reply_to):
         return "Alindi, calisiyorum... (bitince yazacagim; /abort ile durdurabilirsin)", True
     return "Halen bir is calisiyor. Bitmesini bekle ya da /abort ile durdur.", False
@@ -2431,7 +2845,7 @@ def handle_callback(cb):
     frm = cb.get("from", {}) or {}
     uid = frm.get("id")
     label = ("@" + frm.get("username")) if frm.get("username") else str(uid or "?")
-    if uid is None or not is_allowed(uid):
+    if uid is None or not is_allowed_user(uid):
         answer_callback(cb_id)
         log("DENIED-cb user=%s data=%.40s" % (label, data))
         return
@@ -2546,7 +2960,7 @@ def handle_update(u):
             return
     user = msg.get("from", {})
     label = ("@" + user.get("username")) if user.get("username") else str(user.get("id", "?"))
-    if not is_allowed(chat_id):
+    if not is_allowed_chat(chat_id, user.get("id")):
         log("DENIED chat=%s user=%s text=%.60s" % (chat_id, label, text))
         return
     photo = msg.get("photo")
@@ -2719,6 +3133,7 @@ def main_loop():
         except Exception as e:  # noqa: BLE001
             log("acilis ping gonderilemedi: %s" % str(e)[-150:])
     last_sweep = [time.time()]
+    consecutive_errors = 0
     while True:
         try:
             _flush_media()
@@ -2735,9 +3150,7 @@ def main_loop():
                                                          "callback_query"]},
                       timeout=POLL_TIMEOUT + 15)
             if not res.get("ok"):
-                log("getUpdates ok=false: %.200s" % json.dumps(res))
-                time.sleep(5)
-                continue
+                raise RuntimeError("getUpdates ok=false: %.200s" % json.dumps(res))
             for u in res.get("result", []):
                 offset = max(offset, int(u.get("update_id", 0)) + 1)
                 handle_update(u)
@@ -2745,6 +3158,9 @@ def main_loop():
             if s or f:
                 log("outbox flush: sent=%d failed=%d" % (s, f))
             heartbeat(offset)
+            if consecutive_errors:
+                log("baglanti duzeldi (onceki hata sayaci: %d)" % consecutive_errors)
+            consecutive_errors = 0
         except KeyboardInterrupt:
             log("durduruldu.")
             heartbeat(offset, {"stopped": _now()})
@@ -2756,8 +3172,18 @@ def main_loop():
                     "Diger bridge penceresini/komutunu kapatip tek ornek birakin.")
             else:
                 log("loop hatasi: %s" % msg[-300:])
-            heartbeat(offset, {"last_error": msg[-200:]})
-            time.sleep(5)
+            consecutive_errors += 1
+            heartbeat(offset, {"last_error": msg[-200:],
+                               "consecutive_errors": consecutive_errors})
+            if consecutive_errors >= LOOP_MAX_CONSECUTIVE_ERRORS:
+                # Uste uste hata: donmus olabiliriz. Sessizce calismaya devam
+                # etmek, kullaniciya "kopru ayakta" yanlis bilgi verir.
+                log("ust uste %d hata: kopru durduruluyor." % consecutive_errors)
+                _notify_death("%d kez ust uste hata: %s"
+                              % (consecutive_errors, msg[-200:]))
+                sys.exit(4)
+            time.sleep(min(5 * consecutive_errors, 30))
+    _serve_stop()
 
 
 def selftest():

@@ -6,10 +6,12 @@ task ver, `/onay` ile devam ettir. Mimari: Telegram bot + `bridge.py` (daemon) +
 
 ## On sart
 
-- PC acik ve internete bagli olacak (bridge bu PC'de calisir).
-  PC kapaliysa calismaz — o durumda VPS notuna bak.
+- PC basinda degilken calisir; PC kapaliysa calismaz. Baska bir makinede
+  calistirmak icin bu bolumun sonundaki VPS notuna bakin.
 - Python 3.10+ ve `opencode` CLI PATH'te (`opencode --version`).
-- Bu repo: `opencode.json` icinde `telegram` MCP kaydi acik gelir.
+- Bu repo TEK BASINA durur: `opencode.json` icinde hazir bir `telegram`
+  kaydi **gelmez** (eski surumden kalan bir aciklamaydi). Kaydi kurulum
+  adiminda biz yaziyoruz; bkz. Asagida "Global kurulum".
 
 ## Adim 1 — Bot ac
 

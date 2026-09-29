@@ -1,5 +1,69 @@
 # Changelog — opencode-telegram
 
+## Unreleased (2.4.0)
+
+Guven, yetki, arayuz ve temizlik paketi. Testler 174 -> 250.
+
+### Guven
+
+- **Kopru artik sessizce olmuyor.** `main_loop` her seyi yutup `continue` ediyordu,
+  dolayisiyla `__main__`'e hicbir sey kacmiyordu ve `_notify_death` olu koddu. Donmus
+  bir kopru Telegram'dan hicbir sey bildirmiyordu. Artik ardisik hatalar sayilir
+  (`TELEGRAM_LOOP_MAX_ERRORS`, varsayilan 5), basarili bir tur sayaci sifirlar,
+  esik de Telegram'a bildirim gonderilir ve surec `exit 4` ile temizce kapanir.
+  Bekleme suresi de ustel (5sn -> 30sn).
+- **Kredisi biten saglayiciya istek atilmaz.** Canli testte `orcarouter` kredisinin
+  bittigini fark etmeden iki mesaj gonderilmisti. Artik kredi/kota hatalari
+  (`out of credits`, `insufficient_quota`, `402`, `billing limit`...) taninir,
+  cevaba kullanim ipucu eklenir, saglayici isaretlenir ve o saglayiciyla YENI istek
+  calistirilmaz (6 saat, `TELEGRAM_BAD_PROVIDER_TTL_H`).
+- **Olmus serve istemcisi cache'de kalmiyordu.** `serve` olunce (ya da portu baska
+  bir surec kaparsa) kopru kalici olarak kilitleniyor, kurtarmak icin elle yeniden
+  baslatmak gerekiyordu. Artik cache'lenen istemci her kullanimda saglik kontrolunden
+  gecer, oluyse dusurulur ve yeniden kurulur. `main_loop` cikista
+  `_serve_stop()` ile bizim baslattigimiz serve surecini de kapatir.
+
+### Yetki
+
+- **Grup yetki modeli duzeltildi.** Metin mesajlari chat_id ile, inline butonlar
+  user_id ile kontrol ediliyordu ve ikisi de ayni listeye bakiyordu: grupta metin
+  gonderen HERKES makineyi kullanabiliyor, izin/soru butonlari ise hic calismiyordu.
+  Artik `TELEGRAM_ALLOWED_CHAT_IDS` + `TELEGRAM_ALLOWED_USER_IDS` ayrimi var.
+  Ozel sohbette (chat id = user id) eski davranis aynen korunur; grupta kullanici
+  listesi zorunludur, bossa kimse girmez.
+
+### Arayuz
+
+- **Mesaj kuyrugu.** Mesgulken gelen mesaj reddediliyordu ("Halen bir is
+  calisiyor"), kullanici telifte gonderip unutuyordu. Artik kuyruga alinir, is
+  bitince sirayla calisir. `/kuyruk` bekleyeni gosterir, `/kuyruk temizle` bosaltir.
+  Derinlik `TELEGRAM_MAX_QUEUED` (varsayilan 5). Kuyruk bosalirken temizlenirse
+  dongu kirilir; geri cekilen isler arka arkaya calismaz.
+- **Alt klavye (`/klavye`).** Bilerek KAPALI baslar: kalici klavye yazan alanin
+  hemen ustune yerlesir ve normal sohbet gibi yazmak isteyenleri engeller.
+  `/klavye` acar, `/klavye kapat` kapatir. Iki satir, alti buton (Durum, Model,
+  Oturum, Kuyruk, Yeni, Durdur). Butona basilinca metin ajana GONDERILMEZ,
+  once komuta donusur.
+
+### Eklendi
+
+- `scripts/uninstall-global.ps1` + `.sh`: global MCP kaydini ve steering
+  talimatini kaldirir. Kullanicinin diger MCP'leri korunur, yedek alinir.
+- `tests/test_serve_client.py`: 31 test. `serve_client.py` hic testi yoktu
+  (GAP-22) - istek/yanit bicimi, hata siniflari, `wait_reply` zaman asimi ve
+  SSE ayristirma kaplandi.
+- `TELEGRAM_MODEL_PAGE_SIZE`, `TELEGRAM_SESSION_PAGE_SIZE`,
+  `TELEGRAM_MAX_QUEUED`, `TELEGRAM_LOOP_MAX_ERRORS`,
+  `TELEGRAM_BAD_PROVIDER_TTL_H`, `TELEGRAM_ALLOWED_USER_IDS`.
+
+### Duzeltilen (temizlik)
+
+- Dokuman bayatligi: `docs/KURULUM.md` "opencode.json acik gelir" yalanini
+  duzeltti, `steering/telegram-ops.md` var olmayan `TELEGRAM-KURULUM.md` ve
+  `mail_send` referanslarini temizledi.
+- `_save_sess` parametre imzasi: `None` hem "dokunma" hem "temizle" anlamina
+  geliyordu. Artik `_UNSET` sentinel'i var.
+
 ## Unreleased (2.3.0)
 
 Markdown gonderimi. Testler 70 -> 133 (`bridge/md2.py` + 49 yeni test).
