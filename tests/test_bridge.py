@@ -5,8 +5,11 @@ Calistir: pytest opencode-telegram/tests/test_bridge.py
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -244,3 +247,313 @@ def test_digest_push_flush(monkeypatch):
     monkeypatch.setattr(B, "send_message", lambda *a, **k: sent.append(a) or 1)
     assert B._digest_flush() == 1
     assert sent and "selam" in sent[0][1]
+
+
+# ---------------------------------------------------------------- GAP-20
+# PIPE doldugunda cocuk surec yazmada kilitlenir. Onceki surumde _wait_proc
+# yalnizca proc.wait() cagriyordu, hic kimse pipe'i okumuyordu; 64 KB asilince
+# surec hic cikmiyor, bridge OPENCODE_TIMEOUT'a kadar bekleyip cevabi
+# kaybediyordu. Bu test regresyondur.
+
+_BIG = 300000
+
+
+def _big_output_proc():
+    script = ("import sys;"
+              "sys.stdout.write('x'*%d);sys.stderr.write('y'*%d);"
+              "sys.stdout.flush();sys.stderr.flush()" % (_BIG, _BIG // 2))
+    return subprocess.Popen([sys.executable, "-c", script],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+
+
+def test_wait_proc_drains_pipes(monkeypatch):
+    """300 KB stdout + 150 KB stderr: 'ok' donmeli, sure timeout'a takilmamali."""
+    monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    proc = _big_output_proc()
+    t0 = time.time()
+    try:
+        res, out, err = B._wait_proc(proc, None, "111", timeout=20)
+        took = time.time() - t0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert res == "ok", "sonuc: %s" % res
+    assert took < 15, "pipe kilitlendi, surec %.1f sn sonra hala cikmadi" % took
+    assert len(out) == _BIG, "stdout kaybi: %d/%d" % (len(out), _BIG)
+    assert len(err) == _BIG // 2, "stderr kaybi: %d/%d" % (len(err), _BIG // 2)
+
+
+def test_wait_proc_abort_kills_child(monkeypatch):
+    """Cok uzun surec + abort isareti: ABORTED donmeli, surec gercekten olmeli."""
+    monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ev = threading.Event()
+    threading.Timer(1.0, ev.set).start()
+    t0 = time.time()
+    res, _, _ = B._wait_proc(proc, ev, "111", timeout=60)
+    assert res == "ABORTED", res
+    assert time.time() - t0 < 15
+    assert proc.poll() is not None, "surec oldurulmemis"
+
+
+def test_wait_proc_timeout(monkeypatch):
+    monkeypatch.setattr(B, "send_action", lambda *a, **k: None)
+    monkeypatch.setattr(B, "send_message", lambda *a, **k: 1)
+    proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    t0 = time.time()
+    try:
+        res, _, _ = B._wait_proc(proc, None, "111", timeout=2)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert res == "TIMEOUT", res
+    assert 2 <= time.time() - t0 < 15
+
+
+# ---------------------------------------------------------------- GAP-03
+# Mailbox JSON'lari oku-degistir-yaz ile guncellenir. Yazicilar: ana poll loop,
+# her worker thread, zamanlayici ve ayri surec olan MCP server. Onceki
+# surumde lock yoktu ve _save sabit isimli ".tmp" kullaniyordu -> kayit kaybi
+# ve bozuk JSON. Asagidaki testler regresyondur.
+
+def test_inbox_add_concurrent_no_loss():
+    """20 thread ayni dosyaya yazmali: kayit kaybolmamali, ID'ler tekil olmali."""
+    B._save(B.INBOX_FILE, {"seq": 0, "messages": []})
+    n, errs = 20, []
+
+    def _w(i):
+        try:
+            B.inbox_add("111", "@t%d" % i, "mesaj %d" % i)
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+
+    ts = [threading.Thread(target=_w, args=(i,)) for i in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errs, errs
+    st = B._load(B.INBOX_FILE, {})
+    msgs = st.get("messages", [])
+    assert len(msgs) == n, "kayit kaybi: %d/%d" % (len(msgs), n)
+    ids = [m["id"] for m in msgs]
+    assert len(set(ids)) == n, "ID cakismasi (%d tekil): %s" % (len(set(ids)), sorted(ids))
+    assert len(set(m["text"] for m in msgs)) == n, "metin kaybi"
+    assert st["seq"] == n, "seq kaydi: %s" % st.get("seq")
+
+
+def test_json_never_corrupt_under_concurrent_saves():
+    """Yazim sirasinda okuyan biri asla bozuk/eksik veri gormemeli.
+
+    Okuyucu gercek t tuketicilerin yolunu kullanir (`_load`), cunku ham
+    `open()` Windows'ta `os.replace` aninda gecici PermissionError alir ve
+    bu bir bozulma degildir.
+    """
+    B._save(B.BUDGET_FILE, {"seq": 0, "n": 0, "pad": ""})
+    stop, bad = threading.Event(), []
+
+    def _writer():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            B._save(B.BUDGET_FILE, {"seq": i, "n": i, "pad": "x" * 20000})
+
+    def _reader():
+        seen = 0
+        while not stop.is_set():
+            d = B._load(B.BUDGET_FILE, None)
+            if d is None:
+                bad.append("okunamadi")
+                return
+            if not isinstance(d, dict) or d.get("n") is None or d.get("pad") is None:
+                bad.append("bozuk/eksik: %r" % (d,))
+                return
+            seen += 1
+        if seen == 0:
+            bad.append("hic okunamadi")
+
+    ts = ([threading.Thread(target=_writer) for _ in range(2)]
+          + [threading.Thread(target=_reader) for _ in range(2)])
+    for t in ts:
+        t.start()
+    time.sleep(1.0)
+    stop.set()
+    for t in ts:
+        t.join(timeout=5)
+    assert not bad, bad[:2]
+
+
+def test_outbox_flush_sends_once_under_concurrency(monkeypatch):
+    """outbox_flush 3 yerden cagriliyor: ayni QUEUED kayit iki kez gitmemeli."""
+    sent, lk = [], threading.Lock()
+
+    def _fake_send(chat_id, text, reply_to=None):
+        with lk:
+            sent.append(text)
+        time.sleep(0.05)  # gonderim penceresini ac
+        return 1
+
+    monkeypatch.setattr(B, "send_message", _fake_send)
+    B._save(B.OUTBOX_FILE, {"seq": 1, "messages": [
+        {"id": "OUT-001", "ts": "x", "to": "111", "text": "tek sefer",
+         "status": "QUEUED"}]})
+    ts = [threading.Thread(target=B.outbox_flush) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(sent) == 1, "mesaj %d kez gonderildi" % len(sent)
+    m = B._load(B.OUTBOX_FILE, {})["messages"][0]
+    assert m["status"] == "SENT", m
+    assert "attempts" not in m and "next_try" not in m, m
+
+
+def test_outbox_recover_reclaims_stuck_sending():
+    """Surec olurken SENDING'de kalan kayit yeniden kuyruga alinmali."""
+    B._save(B.OUTBOX_FILE, {"seq": 1, "messages": [
+        {"id": "OUT-001", "ts": "x", "to": "111", "text": "takildi",
+         "status": "SENDING", "sending_since": time.time() - 9999}]})
+    assert B.outbox_recover() == 1
+    m = B._load(B.OUTBOX_FILE, {})["messages"][0]
+    assert m["status"] == "QUEUED" and "sending_since" not in m, m
+
+
+def test_outbox_recover_leaves_fresh_sending():
+    """Yeni baslayan baska bir surecin isi ezilmemeli."""
+    B._save(B.OUTBOX_FILE, {"seq": 1, "messages": [
+        {"id": "OUT-001", "ts": "x", "to": "111", "text": "canli",
+         "status": "SENDING", "sending_since": time.time()}]})
+    assert B.outbox_recover() == 0
+    assert B._load(B.OUTBOX_FILE, {})["messages"][0]["status"] == "SENDING"
+
+
+def test_cross_process_write_no_loss():
+    """MCP server ayri bir surec: iki surec ayni dosyayi yaziyor, kayit kaybolmamali."""
+    bridge_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bridge"))
+    target = os.path.join(TMP, "telegram_cross.json")
+    child = os.path.join(TMP, "_child_writer.py")
+    with open(child, "w", encoding="utf-8") as f:
+        f.write(
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import atomic_json as aj\n"
+            "P = %r\n"
+            "for _ in range(15):\n"
+            "    with aj.tx(P):\n"
+            "        st = aj.load(P, {})\n"
+            "        st['n'] = st.get('n', 0) + 1\n"
+            "        aj.save(P, st)\n" % (bridge_dir, target))
+    B._save(target, {"n": 0})
+    proc = subprocess.Popen([sys.executable, child])
+    try:
+        for _ in range(15):
+            with B._aj.tx(target):
+                st = B._load(target, {})
+                st["n"] = st.get("n", 0) + 1
+                B._save(target, st)
+        assert proc.wait(timeout=60) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert B._load(target, {}).get("n") == 30, "kayit kaybi: %s" % B._load(target, {})
+
+
+# ---------------------------------------------------------------- GAP-04 / 10 / 13 / 16
+
+def test_edited_message_does_not_rerun(monkeypatch):
+    """GAP-04: duzenleme ayni isi ikinci kez tetiklememeli."""
+    monkeypatch.setattr(B, "FOLLOW_EDITS", False)
+    ran = []
+    monkeypatch.setattr(B, "_gate_or_spawn",
+                        lambda *a, **k: (ran.append(a[2]) or ("ok", True)))
+    upd = {"edited_message": {"chat": {"id": 111}, "message_id": 7,
+                              "from": {"id": 111}, "text": "duzeltilmis soru"}}
+    B.handle_update(upd)
+    assert not ran, "duzenleme isi tetikledi: %s" % ran
+
+
+def test_edited_message_dedup_when_enabled(monkeypatch):
+    """GAP-04: FOLLOW_EDITS=1 iken ayni duzenleme yine bir kez islenir."""
+    monkeypatch.setattr(B, "FOLLOW_EDITS", True)
+    B._seen_edits.clear()
+    ran = []
+    monkeypatch.setattr(B, "_gate_or_spawn",
+                        lambda *a, **k: (ran.append(a[2]) or ("ok", True)))
+    upd = {"edited_message": {"chat": {"id": 111}, "message_id": 8,
+                              "from": {"id": 111}, "text": "soru v2"}}
+    B.handle_update(upd)
+    B.handle_update(upd)
+    assert ran == ["soru v2"], ran
+
+
+def test_finish_streamed_chunks_overflow(monkeypatch):
+    """GAP-10: 4000 karakteri asan cevap kesilmemeli, parca parca gitmeli."""
+    edits, sends = [], []
+    monkeypatch.setattr(B, "edit_message",
+                        lambda c, m, t: edits.append(t) or True)
+    monkeypatch.setattr(B, "send_message", lambda c, t, reply_to=None: sends.append(t) or 1)
+    long_out = "".join(chr(97 + (i % 26)) for i in range(11000))
+    B._finish_streamed("111", 42, long_out, "TG-001")
+    assert len(edits) == 1 and "TG-001" in edits[0]
+    assert len(edits[0]) <= 4000, "ilk mesaj limiti asti: %d" % len(edits[0])
+    assert "".join(sends) == long_out[3800:], "tasma kaybi: %d" % len("".join(sends))
+    assert all(len(s) <= 4000 for s in sends)
+
+
+def test_version_is_read_from_file():
+    """GAP-13: surum tek kaynaktan (VERSION) okunur."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    p = os.path.join(root, "VERSION")
+    assert os.path.exists(p), "VERSION dosyasi yok"
+    with open(p, encoding="utf-8") as f:
+        want = f.read().strip()
+    assert B.VERSION == want, "%s != %s" % (B.VERSION, want)
+    assert B.VERSION[0].isdigit(), "surum bicimlendirmesi: %r" % B.VERSION
+
+
+def test_mcp_version_matches_bridge():
+    """GAP-13: MCP sunucusu ayni surumu bildirmeli."""
+    spec = importlib.util.spec_from_file_location(
+        "tgmcp2", os.path.join(os.path.dirname(__file__), "..", "mcp", "server.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert m.VERSION == B.VERSION, "%s != %s" % (m.VERSION, B.VERSION)
+
+
+def test_cleanup_tg_files_by_age_and_count(monkeypatch):
+    """GAP-16: indirilen ekler yas + adet limitiyle temizlenmeli."""
+    d = os.path.join(TMP, "tg_files")
+    os.makedirs(d, exist_ok=True)
+    for n in os.listdir(d):
+        os.remove(os.path.join(d, n))
+    old = os.path.join(d, "eski.jpg")
+    for i in range(5):
+        p = os.path.join(d, "yeni_%d.jpg" % i)
+        with open(p, "wb") as f:
+            f.write(b"x")  # yeni: mtime simdi
+    with open(old, "wb") as f:
+        f.write(b"x")
+    os.utime(old, (time.time() - 86400, time.time() - 86400))  # 24 saat once
+    monkeypatch.setattr(B, "TG_FILES_MAX_AGE", 3600)
+    monkeypatch.setattr(B, "TG_FILES_MAX_COUNT", 2)
+    n = B._cleanup_tg_files()
+    left = sorted(os.listdir(d))
+    assert not os.path.exists(old), "yasli dosya silinmedi"
+    assert n >= 1
+    assert len(left) == 2, "adet limiti uygulanmadi: %s" % left
+
+
+def test_send_message_chunks(monkeypatch):
+    """4000 karakter ustu metin parcalara bolunmeli (Telegram siniri)."""
+    sent = []
+    monkeypatch.setattr(B, "api", lambda m, p=None, timeout=45: sent.append((m, p)) or {"ok": True})
+    B.send_message("111", "y" * 9500)
+    texts = [p["text"] for (m, p) in sent if m == "sendMessage"]
+    assert len(texts) == 3, len(texts)
+    assert all(len(t) <= 4000 for t in texts)
+    assert "".join(texts) == "y" * 9500

@@ -13,10 +13,19 @@ Guvenlik: gonderim hedefi bridge tarafinda allowlist'e tabidir.
 Buraya secret/token yazilmasin (communication-protocol.md kurali).
 """
 
+import contextlib
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BRIDGE = os.path.normpath(os.path.join(_HERE, "..", "bridge"))
+if _BRIDGE not in sys.path:
+    sys.path.insert(0, _BRIDGE)
+
+import atomic_json as _aj  # noqa: E402  (bridge ile ayni kilit protokolu)
 
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
@@ -24,6 +33,19 @@ import mcp.server.stdio
 import mcp.types as types
 
 server = Server("telegram")
+
+
+def _pkg_version(default="0.0.0"):
+    """Tek surum kaynagi: paket kokundeki VERSION (bridge ile ayni dosya)."""
+    p = os.path.normpath(os.path.join(_HERE, "..", "VERSION"))
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip() or default
+    except OSError:
+        return default
+
+
+VERSION = _pkg_version()
 
 
 def _root():
@@ -61,22 +83,18 @@ def _path(name):
 
 
 def _load(name, default):
-    p = _path(name)
-    if not os.path.exists(p):
-        return default
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return default
+    return _aj.load(_path(name), default)
 
 
 def _save(name, state):
-    p = _path(name)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, p)
+    _aj.save(_path(name), state)
+
+
+@contextlib.contextmanager
+def _tx(name):
+    """bridge ile ayni kilit: iki surec ayni dosyaya yazarken kayit kaybettirmesin."""
+    with _aj.tx(_path(name)):
+        yield
 
 
 def _text(s):
@@ -158,40 +176,50 @@ async def handle_call_tool(name: str, arguments: dict):
                 return _text("Error: text bos olamaz.")
             if len(text) > 20000:
                 return _text("Error: text 20000 karakteri asamaz (bridge 4000'lik parcalar gonderir).")
-            state = _load("telegram_outbox.json", {"seq": 0, "messages": []})
-            state["seq"] += 1
-            msg = {
-                "id": "OUT-%03d" % state["seq"],
-                "ts": _now(),
-                "to": str(arguments.get("to") or "").strip() or "default",
-                "text": text,
-                "status": "QUEUED",
-            }
-            state["messages"].append(msg)
-            # kuyrugu sisirmemek icin son 200 SENT kaydi budanir
-            sent = [m for m in state["messages"] if m.get("status") != "QUEUED"]
-            if len(sent) > 200:
-                keep = [m for m in state["messages"] if m.get("status") == "QUEUED"] + sent[-200:]
-                # sira bozulmasin diye ts'ye gore degil, eklenme sirasi korunur
-                state["messages"] = keep
-            _save("telegram_outbox.json", state)
+            to = str(arguments.get("to") or "").strip() or "default"
+            with _tx("telegram_outbox.json"):
+                state = _load("telegram_outbox.json", {"seq": 0, "messages": []})
+                state["seq"] += 1
+                msg = {
+                    "id": "OUT-%03d" % state["seq"],
+                    "ts": _now(),
+                    "to": to,
+                    "text": text,
+                    "status": "QUEUED",
+                }
+                state["messages"].append(msg)
+                # kuyrugu sisirmemek icin son 200 SENT kaydi budanir
+                sent = [m for m in state["messages"] if m.get("status") != "QUEUED"]
+                if len(sent) > 200:
+                    keep = [m for m in state["messages"] if m.get("status") == "QUEUED"] + sent[-200:]
+                    # sira bozulmasin diye ts'ye gore degil, eklenme sirasi korunur
+                    state["messages"] = keep
+                _save("telegram_outbox.json", state)
             return _text("Queued %s -> %s (bridge gonderecek)" % (msg["id"], msg["to"]))
 
         elif name == "telegram_broadcast":
             text = (arguments.get("text") or "").strip()
             if not text:
                 return _text("Error: text bos olamaz.")
-            state = _load("telegram_outbox.json", {"seq": 0, "messages": []})
-            state["seq"] += 1
-            msg = {
-                "id": "OUT-%03d" % state["seq"],
-                "ts": _now(),
-                "to": "broadcast",
-                "text": text,
-                "status": "QUEUED",
-            }
-            state["messages"].append(msg)
-            _save("telegram_outbox.json", state)
+            if len(text) > 20000:
+                return _text("Error: text 20000 karakteri asamaz (bridge 4000'lik parcalar gonderir).")
+            with _tx("telegram_outbox.json"):
+                state = _load("telegram_outbox.json", {"seq": 0, "messages": []})
+                state["seq"] += 1
+                msg = {
+                    "id": "OUT-%03d" % state["seq"],
+                    "ts": _now(),
+                    "to": "broadcast",
+                    "text": text,
+                    "status": "QUEUED",
+                }
+                state["messages"].append(msg)
+                # broadcast da budanir, yoksa outbox sinirsiz buyur
+                sent = [m for m in state["messages"] if m.get("status") != "QUEUED"]
+                if len(sent) > 200:
+                    state["messages"] = ([m for m in state["messages"]
+                                          if m.get("status") == "QUEUED"] + sent[-200:])
+                _save("telegram_outbox.json", state)
             return _text("Queued %s -> broadcast" % msg["id"])
 
         elif name == "telegram_poll":
@@ -206,13 +234,14 @@ async def handle_call_tool(name: str, arguments: dict):
         elif name == "telegram_ack":
             raw = arguments.get("msg_ids", "")
             ids = [i.strip() for i in str(raw).replace(";", ",").split(",") if i.strip()]
-            state = _load("telegram_inbox.json", {"seq": 0, "messages": []})
             done = []
-            for m in state.get("messages", []):
-                if m.get("id") in ids and m.get("status") == "UNREAD":
-                    m["status"] = "READ"
-                    done.append(m["id"])
-            _save("telegram_inbox.json", state)
+            with _tx("telegram_inbox.json"):
+                state = _load("telegram_inbox.json", {"seq": 0, "messages": []})
+                for m in state.get("messages", []):
+                    if m.get("id") in ids and m.get("status") == "UNREAD":
+                        m["status"] = "READ"
+                        done.append(m["id"])
+                _save("telegram_inbox.json", state)
             return _text("Acked: %s" % (", ".join(done) if done else "(yok)"))
 
         elif name == "telegram_status":
@@ -253,7 +282,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="telegram",
-                server_version="1.0.0",
+                server_version=VERSION,
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
