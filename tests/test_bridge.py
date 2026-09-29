@@ -620,6 +620,7 @@ def test_set_my_commands_never_breaks_startup(monkeypatch):
 
 # ================================================================ C: kademeli throttle
 # Sabit 2 sn yerine sureye gore kademeli: kisa isler akici, uzun isler rate
+# limit'e takilmaz.
 
 def test_progressive_throttle_tiers():
     assert B.progressive_throttle(0) == 1.0

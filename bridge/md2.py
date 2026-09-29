@@ -22,7 +22,6 @@ Iki ayrica onlem:
     metin blogu guvenle satir sinirindan bolunebilir.
   * Yer tutucu karakteri girdide varsa (orn. model NUL yazdiysa) bozulma
     olmamasi icin metinde bulunmayan bir kod noktasi secilir.
-
 """
 
 import re

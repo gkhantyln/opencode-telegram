@@ -97,7 +97,7 @@ Markdown gonderimi. Testler 70 -> 133 (`bridge/md2.py` + 49 yeni test).
 
 ## Unreleased (2.2.0)
 
-v0.26.1 incelemesi; alinan davranislar stdlib ile yeniden yazildi.
+Arayuz ve API dayanikligi turu. Alinan davranislar stdlib ile yeniden yazildi.
 Testler 45 -> 70.
 
 ### Eklendi

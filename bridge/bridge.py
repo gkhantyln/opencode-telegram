@@ -1361,7 +1361,6 @@ def progressive_throttle(elapsed_sec):
       <5 dk   -> 2 sn
       <15 dk  -> 5 sn
       >=15 dk -> 10 sn  (uzun islerde rate limit'e takilmaz)
-
     """
     t = max(0.0, float(elapsed_sec or 0))
     if t < 60:
