@@ -23,6 +23,14 @@ telegram_audit.log.*
 *.lock
 *.tmp
 
+# --- log dosyalari (canli test bulgusu) ---
+# Canli testte bridge ciktisi bridge_live.log'a yonlendirildi ve blanket
+# kural olmadigi icin commit'lenebiliyordu. Loglar mesaj metni ve model
+# ciktisi tasir; hicbir zaman commit edilmemeli.
+*.log
+*.err
+*.out
+
 # --- Telegram'dan indirilen ekler (20 MB'a kadar, otomatik silinmez) ---
 tg_files/
 **/tg_files/

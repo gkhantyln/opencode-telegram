@@ -34,7 +34,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          for p in .env .opencode/mailbox/telegram_audit.log GAP-PLAN.md; do
+          for p in .env .opencode/mailbox/telegram_audit.log GAP-PLAN.md \
+                   bridge_live.log bridge_live.err audit.log; do
             if ! git check-ignore -q "$p"; then
               echo "::error:: $p ignore edilmiyor - sizinti riski"
               exit 1
@@ -47,6 +48,13 @@ jobs:
             exit 1
           fi
           echo "OK .env.example repoda kalir"
+          # repoda izlenen log/artifact olmamali
+          if git ls-files | grep -qE '\.(log|err|out)$'; then
+            echo "::error:: repoda izlenen log dosyasi var"
+            git ls-files | grep -E '\.(log|err|out)$'
+            exit 1
+          fi
+          echo "OK repoda izlenen log yok"
 
       - name: Surum tutarliligi (GAP-13)
         shell: bash
