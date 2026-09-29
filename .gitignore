@@ -1,0 +1,57 @@
+# ============================================
+# opencode-telegram - gitignore
+# ============================================
+# Kritik: bridge bu dizinde calistiginda .env (bot token) ve calisma
+# zamani uretilen mailbox/audit/dosya artiklari olusur. Bunlar hicbir
+# zaman commit edilmemeli. Dogrulama:
+#   git check-ignore -v .env .opencode/mailbox/telegram_audit.log
+# ============================================
+
+# --- secrets: bot token, chat id'ler ---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- calisma zamani durumu (bridge bunlari uretir) ---
+.opencode/mailbox/
+telegram_*.json
+telegram_*.log
+telegram_debug.log
+telegram_audit.log
+telegram_audit.log.*
+*.lock
+*.tmp
+
+# --- Telegram'dan indirilen ekler (20 MB'a kadar, otomatik silinmez) ---
+tg_files/
+**/tg_files/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# --- editor / isletim sistemi ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- kurulum araclari ---
+*.bak
+*.bak-*
+opencode.json.bak*
+
+# --- yerel planlama / calisma notlari (GitHub'da tutulmaz) ---
+GAP-PLAN.md

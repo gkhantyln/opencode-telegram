@@ -1,0 +1,58 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Proje Windows-oncelikli ama POSIX'te de calismali (GAP-11).
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Kurulum (sadece test icin gereken tek paket)
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Butun dosyalar derleniyor mu (sozdizimi)
+        run: python -m py_compile bridge/bridge.py bridge/serve_client.py bridge/atomic_json.py mcp/server.py scripts/merge_global_config.py
+
+      - name: Testler
+        run: python -m pytest tests/ -v
+
+      - name: .gitignore sizinti kontrolu (GAP-01 / TG4-1)
+        shell: bash
+        run: |
+          set -e
+          for p in .env .opencode/mailbox/telegram_audit.log GAP-PLAN.md; do
+            if ! git check-ignore -q "$p"; then
+              echo "::error:: $p ignore edilmiyor - sizinti riski"
+              exit 1
+            fi
+            echo "OK ignore: $p"
+          done
+          # .env.example ignore edilmemeli
+          if git check-ignore -q .env.example; then
+            echo "::error:: .env.example ignore edilmis, ornek dosya repoda olmali"
+            exit 1
+          fi
+          echo "OK .env.example repoda kalir"
+
+      - name: Surum tutarliligi (GAP-13)
+        shell: bash
+        run: |
+          v=$(tr -d ' \n\r' < VERSION)
+          echo "VERSION=$v"
+          grep -q "^$v$" VERSION || { echo "::error:: VERSION bicimlendirmesi hatali"; exit 1; }
+          python -c "import sys; sys.exit(0 if '$v'[0].isdigit() else 1)" \
+            || { echo "::error:: VERSION sayi ile baslamali"; exit 1; }
